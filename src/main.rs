@@ -109,8 +109,8 @@ fn print_book(b: &Book) {
     let got = if b.written { " ✓read" } else { "" };
     let sub = if b.subcategory.is_empty() { String::new() } else { format!(" [{}]", b.subcategory) };
     println!("{star}{kind}{title}{sub}{got}", star = star, kind = kind, title = b.title, sub = sub, got = got);
-    if !b.author.is_empty() {
-        let yr = if b.kind == BookKind::Real && !b.year.is_empty() { format!(" ({})", b.year) } else { String::new() };
+    if b.kind == BookKind::Real && !b.author.is_empty() {
+        let yr = if !b.year.is_empty() { format!(" ({})", b.year) } else { String::new() };
         println!("    by {}{}", b.author, yr);
     }
     if !b.hook.is_empty() {

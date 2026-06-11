@@ -292,8 +292,10 @@ impl App {
             out.push('\n');
             out.push_str(&style::bold(&style::fg(&wrap(&b.title, w), if real { C_REAL } else { C_BODY })));
             out.push('\n');
-            if !b.author.is_empty() {
-                let by = if real && !b.year.is_empty() {
+            // Only real books get an author line — conjured books never show
+            // a name, even if a legacy catalog row still carries one.
+            if real && !b.author.is_empty() {
+                let by = if !b.year.is_empty() {
                     format!("by {} ({})", b.author, b.year)
                 } else {
                     format!("by {}", b.author)
@@ -326,11 +328,18 @@ impl App {
     }
 
     fn render_foot(&mut self, msg: &str) {
-        if msg.is_empty() {
-            self.foot.say(&style::fg(" d mark \u{00b7} < purge \u{00b7} * star \u{00b7} + more \u{00b7} s seed \u{00b7} i interests \u{00b7} w/W width \u{00b7} r reload", C_DIM));
+        let (left, color) = if msg.is_empty() {
+            (" d mark \u{00b7} < purge \u{00b7} * star \u{00b7} + more \u{00b7} s seed \u{00b7} i interests \u{00b7} w/W width \u{00b7} r reload".to_string(), C_DIM)
         } else {
-            self.foot.say(&style::fg(msg, C_HEADER));
-        }
+            (msg.to_string(), C_HEADER)
+        };
+        let ver = format!("library v{} ", env!("CARGO_PKG_VERSION"));
+        let pad = (self.cols as usize)
+            .saturating_sub(crust::display_width(&left) + crust::display_width(&ver));
+        self.foot.say(&format!("{}{}{}",
+            style::fg(&left, color),
+            " ".repeat(pad),
+            style::fg(&ver, C_DIM)));
     }
 
     fn toggle_star(&mut self) {
