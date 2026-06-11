@@ -6,7 +6,7 @@
 //! next build step.
 
 use std::collections::HashSet;
-use std::sync::{Arc, Mutex};
+use std::sync::mpsc::{self, Receiver, Sender};
 
 use crust::{Crust, Input, Pane, style};
 
@@ -29,7 +29,10 @@ const SPINNER: [&str; 10] = ["⠋","⠙","⠹","⠸","⠼","⠴","⠦","⠧","�
 
 enum Entry { Header(String), Book(usize) }
 
-type GenSlot = Arc<Mutex<Option<Result<Vec<Book>, String>>>>;
+/// A finished generation batch (or its error) handed back from a worker
+/// thread over the channel. Generation is fully async: the UI stays
+/// interactive while batches brew, and results merge in when they land.
+type GenResult = Result<Vec<Book>, String>;
 
 pub struct App {
     cols: u16,
@@ -43,8 +46,9 @@ pub struct App {
     sel: usize,
     top_row: usize,
     delete_marked: HashSet<String>,
-    gen: GenSlot,
-    generating: bool,
+    gen_tx: Sender<GenResult>,
+    gen_rx: Receiver<GenResult>,
+    gen_in_flight: usize,
     spin: usize,
     list_w: u16,
 }
@@ -74,6 +78,7 @@ impl App {
         right.scroll = false; right.wrap = false;
         let mut foot = Pane::new(1, rows, cols, 1, C_DIM as u16, 236);
         foot.scroll = false; foot.wrap = false;
+        let (gen_tx, gen_rx) = mpsc::channel();
         let mut app = App {
             cols, rows, top, left, right, foot,
             cat,
@@ -81,8 +86,8 @@ impl App {
             sel: 0,
             top_row: 0,
             delete_marked: HashSet::new(),
-            gen: Arc::new(Mutex::new(None)),
-            generating: false,
+            gen_tx, gen_rx,
+            gen_in_flight: 0,
             spin: 0,
             list_w,
         };
@@ -223,13 +228,19 @@ impl App {
         let marked = self.delete_marked.len();
         let mark_s = if marked > 0 { format!("  \u{00b7}  {} marked", marked) } else { String::new() };
         let title = format!(" library   {} books \u{00b7} {} written{}", n, written, mark_s);
-        let hint = "\u{2191}\u{2193} \u{00b7} * star \u{00b7} d/< del \u{00b7} + more \u{00b7} s seed \u{00b7} \u{21b5} read \u{00b7} q ";
+        // Right side: a live "brewing" indicator while batches generate in
+        // the background. Keys live in the footer only (no duplicate map).
+        let right = if self.gen_in_flight > 0 {
+            format!("{} {} brewing\u{2026} ", SPINNER[self.spin], self.gen_in_flight)
+        } else {
+            String::new()
+        };
         let pad = (self.cols as usize)
-            .saturating_sub(crust::display_width(&title) + crust::display_width(hint));
+            .saturating_sub(crust::display_width(&title) + crust::display_width(&right));
         self.top.say(&format!("{}{}{}",
             style::bold(&style::fg(&title, C_SEL)),
             " ".repeat(pad),
-            style::fg(hint, C_DIM)));
+            style::fg(&right, C_REAL)));
     }
 
     fn render_left(&mut self) {
@@ -364,7 +375,9 @@ impl App {
         } else {
             "More books on: "
         };
-        let input = self.foot.ask(prompt, "").trim().to_string();
+        let input = self.foot.ask(prompt, "");
+        if self.foot.last_escaped { self.render_foot(""); return; } // ESC cancels
+        let input = input.trim().to_string();
 
         // Resolve the interests to generate from + an optional topic focus.
         let (interests, topic): (String, Option<String>) = if seed {
@@ -391,44 +404,46 @@ impl App {
         };
 
         let existing: Vec<String> = self.cat.books.iter().map(|b| b.title.clone()).collect();
-        let slot = self.gen.clone();
+        let tx = self.gen_tx.clone();
         std::thread::spawn(move || {
             let res = match topic {
                 Some(t) => claude::more_like(&t, &interests, &existing, GEN_N),
                 None => claude::generate_catalog(&interests, &existing, GEN_N),
             };
-            if let Ok(mut g) = slot.lock() { *g = Some(res); }
+            let _ = tx.send(res);
         });
-        self.generating = true;
-        self.spin = 0;
+        self.gen_in_flight += 1;
+        self.render_top();
+        self.render_foot(" Brewing a batch in the background \u{2014} keep browsing.");
     }
 
-    /// Poll the generation slot; merge results (or show the error) when
-    /// the worker finishes. Returns true while still generating.
-    fn poll_generation(&mut self) -> bool {
-        let done = self.gen.lock().ok().and_then(|mut g| g.take());
-        match done {
-            None => {
-                self.spin = (self.spin + 1) % SPINNER.len();
-                self.render_foot(&format!(" {} summoning books from the aether\u{2026}", SPINNER[self.spin]));
-                true
-            }
-            Some(Ok(books)) => {
-                let got = books.len();
-                let added = self.cat.add(books);
-                let _ = self.cat.save();
-                self.rebuild(None);
-                self.generating = false;
-                self.render_all();
-                self.render_foot(&format!(" Added {} new book(s) ({} were duplicates).", added, got - added));
-                false
-            }
-            Some(Err(e)) => {
-                self.generating = false;
-                self.render_foot(&format!(" Generation failed: {}", e));
-                false
+    /// Collect any finished generation batches (non-blocking) and merge
+    /// their books. Runs every loop iteration, so results land while the
+    /// user keeps browsing/reading. Returns true if anything arrived.
+    fn drain_generations(&mut self) -> bool {
+        let mut landed = false;
+        while let Ok(res) = self.gen_rx.try_recv() {
+            self.gen_in_flight = self.gen_in_flight.saturating_sub(1);
+            landed = true;
+            match res {
+                Ok(books) => {
+                    let got = books.len();
+                    let added = self.cat.add(books);
+                    let _ = self.cat.save();
+                    self.rebuild(None);
+                    self.render_all();
+                    self.render_foot(&format!(" Added {} new book(s) ({} duplicates skipped).", added, got - added));
+                }
+                Err(e) => self.render_foot(&format!(" Generation failed: {}", e)),
             }
         }
+        if landed { self.render_top(); }
+        landed
+    }
+
+    fn tick_spinner(&mut self) {
+        self.spin = (self.spin + 1) % SPINNER.len();
+        self.render_top();
     }
 
     fn grab(&mut self) {
@@ -439,13 +454,16 @@ impl App {
 
     fn run(&mut self) {
         loop {
-            if self.generating {
-                // Spin + poll on a 1s tick so the UI stays responsive.
-                let _ = Input::getchr(Some(1));
-                if !self.poll_generation() { /* finished */ }
+            // Block forever when idle (zero idle wakeups); while batches are
+            // brewing, wake every second to tick the spinner and collect
+            // finished work — so the UI stays fully interactive throughout.
+            let timeout = if self.gen_in_flight > 0 { Some(1) } else { None };
+            let key = Input::getchr(timeout);
+            self.drain_generations();
+            let Some(key) = key else {
+                if self.gen_in_flight > 0 { self.tick_spinner(); }
                 continue;
-            }
-            let Some(key) = Input::getchr(None) else { continue };
+            };
             match key.as_str() {
                 "q" | "ESC" => break,
                 "j" | "DOWN" => self.move_sel(true),

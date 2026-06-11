@@ -71,9 +71,11 @@ fn parse_books(raw: &str) -> Result<Vec<Book>, String> {
         .map_err(|e| format!("parse books: {}", e))?;
     Ok(gen.into_iter().map(|g| {
         let kind = if g.kind.trim().eq_ignore_ascii_case("real") { BookKind::Real } else { BookKind::Conjured };
+        // Conjured books carry no author — never present a made-up name.
+        let author = if kind == BookKind::Real { g.author.trim().to_string() } else { String::new() };
         Book {
             title: g.title.trim().to_string(),
-            author: g.author.trim().to_string(),
+            author,
             category: if g.category.trim().is_empty() { "Miscellany".into() } else { g.category.trim().to_string() },
             subcategory: g.subcategory.trim().to_string(),
             hook: g.hook.trim().to_string(),
@@ -112,11 +114,13 @@ reading.\n\n\
 MIX IN REAL BOOKS: make roughly one in four a REAL, actually-published book \
 that genuinely fits the interests (kind \"real\") — use its true title, real \
 author, and publication year. The rest are invented books that should exist \
-(kind \"conjured\") with a fitting author persona. Both kinds get a hook.{avoid}\n\n\
+(kind \"conjured\"); these have NO author — do not invent one. Both kinds get \
+a hook.{avoid}\n\n\
 Respond with ONLY a JSON array (no markdown fences, no prose before or \
 after). Each element:\n\
-{{\"title\": \"...\", \"author\": \"real author for real books, a fitting \
-persona for conjured ones\", \"kind\": \"real\" or \"conjured\", \"year\": \
+{{\"title\": \"...\", \"author\": \"the real author for real books; empty \
+string for conjured books (never invent an author)\", \"kind\": \"real\" or \
+\"conjured\", \"year\": \
 \"publication year for real books, else empty\", \"isbn\": \"ISBN if known \
 for real books, else empty\", \"category\": \"top-level shelf, e.g. Physics, \
 Philosophy, History, Mathematics, Technology\", \"subcategory\": \"finer \
