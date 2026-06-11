@@ -62,6 +62,9 @@ pub struct Catalog {
     /// Persisted shelf-list pane width (columns). 0 = use the default.
     #[serde(default)]
     pub list_w: u16,
+    /// Persisted border mode: 0 none, 1 right, 2 both, 3 left.
+    #[serde(default)]
+    pub border: u8,
 }
 
 pub fn home() -> PathBuf {

@@ -21,6 +21,7 @@ const C_DEL:    u8 = 88;   // marked-for-deletion (dark red)
 const C_REAL:   u8 = 222;  // real (existing) books — warm gold
 const C_HOOK:   u8 = 250;  // hook body
 const C_TAG:    u8 = 109;  // tags
+const C_BORDER: u8 = 238;  // pane borders
 
 const LIST_W: u16 = 46;
 const GEN_N: usize = 10;   // books per `+`/`s` batch
@@ -51,6 +52,8 @@ pub struct App {
     gen_in_flight: usize,
     spin: usize,
     list_w: u16,
+    border: u8,
+    search: String,
 }
 
 pub fn run() {
@@ -68,13 +71,17 @@ impl App {
     fn new() -> Self {
         let (cols, rows) = Crust::terminal_size();
         let cat = Catalog::load();
-        let body_h = rows.saturating_sub(3);
-        let list_w = if cat.list_w >= 24 && cat.list_w + 24 < cols { cat.list_w } else { LIST_W.min(cols.saturating_sub(24)) };
+        // Body spans rows 3..rows-2. Row 2 + row rows-1 are gaps reserved for
+        // the top/bottom borders; col 1 and col `cols` are the side-border
+        // gaps. Content sits in the same place whether borders are on or off.
+        let body_h = rows.saturating_sub(4);
+        let list_w = if cat.list_w >= 24 && cat.list_w + 28 < cols { cat.list_w } else { LIST_W.min(cols.saturating_sub(28)) };
+        let border = cat.border.min(3);
         let mut top = Pane::new(1, 1, cols, 1, C_SEL as u16, 236);
         top.scroll = false; top.wrap = false;
-        let mut left = Pane::new(1, 3, list_w, body_h, C_BODY as u16, 0);
+        let mut left = Pane::new(2, 3, list_w, body_h, C_BODY as u16, 0);
         left.scroll = false; left.wrap = false;
-        let mut right = Pane::new(list_w + 2, 3, cols.saturating_sub(list_w + 1), body_h, C_BODY as u16, 0);
+        let mut right = Pane::new(list_w + 4, 3, cols.saturating_sub(list_w + 4), body_h, C_BODY as u16, 0);
         right.scroll = false; right.wrap = false;
         let mut foot = Pane::new(1, rows, cols, 1, C_DIM as u16, 236);
         foot.scroll = false; foot.wrap = false;
@@ -90,16 +97,44 @@ impl App {
             gen_in_flight: 0,
             spin: 0,
             list_w,
+            border,
+            search: String::new(),
         };
+        app.apply_border_state();
         app.rebuild(None);
         app
+    }
+
+    /// Map the 0-3 border mode onto the two panes (0 none, 1 right, 2 both,
+    /// 3 left — same as pointer/kastrup).
+    fn apply_border_state(&mut self) {
+        self.left.border = matches!(self.border, 2 | 3);
+        self.left.border_fg = Some(C_BORDER as u16);
+        self.right.border = matches!(self.border, 1 | 2);
+        self.right.border_fg = Some(C_BORDER as u16);
+    }
+
+    fn refresh_borders(&mut self) {
+        if self.left.border { self.left.border_refresh(); }
+        if self.right.border { self.right.border_refresh(); }
+    }
+
+    /// `Ctrl-B` — cycle border mode (none → right → both → left), persisted.
+    fn cycle_border(&mut self) {
+        self.border = (self.border + 1) % 4;
+        self.cat.border = self.border;
+        let _ = self.cat.save();
+        self.apply_border_state();
+        self.relayout();
+        let label = ["none", "right", "both", "left"][self.border as usize];
+        self.render_foot(&format!(" Border: {}", label));
     }
 
     /// Recompute pane geometry after a width change and repaint clean.
     fn relayout(&mut self) {
         self.left.w = self.list_w;
-        self.right.x = self.list_w + 2;
-        self.right.w = self.cols.saturating_sub(self.list_w + 1);
+        self.right.x = self.list_w + 4;
+        self.right.w = self.cols.saturating_sub(self.list_w + 4);
         Crust::clear_screen();
         self.top.invalidate();
         self.foot.invalidate();
@@ -111,7 +146,7 @@ impl App {
     fn cycle_width(&mut self, wider: bool) {
         let step = 4u16;
         let min = 24u16;
-        let max = self.cols.saturating_sub(24);
+        let max = self.cols.saturating_sub(28);
         let new = if wider { self.list_w.saturating_add(step) } else { self.list_w.saturating_sub(step) };
         self.list_w = new.clamp(min, max.max(min));
         self.cat.list_w = self.list_w;
@@ -155,12 +190,17 @@ impl App {
     /// rebuild; otherwise the current selection is clamped.
     fn rebuild(&mut self, keep: Option<String>) {
         let want = keep.or_else(|| self.selected_book_id());
+        let q = self.search.to_lowercase();
         let mut entries = Vec::new();
         for category in self.cat.categories() {
+            // Books in this category that match the active search (if any).
+            let hits: Vec<usize> = self.cat.books.iter().enumerate()
+                .filter(|(_, b)| b.category == category && book_matches(b, &q))
+                .map(|(i, _)| i)
+                .collect();
+            if hits.is_empty() { continue; } // skip empty categories under a search
             entries.push(Entry::Header(category.clone()));
-            for (i, b) in self.cat.books.iter().enumerate() {
-                if b.category == category { entries.push(Entry::Book(i)); }
-            }
+            for i in hits { entries.push(Entry::Book(i)); }
         }
         self.entries = entries;
         // Restore selection by id, else land on the first book.
@@ -220,6 +260,7 @@ impl App {
         self.render_left();
         self.render_right();
         self.render_foot("");
+        self.refresh_borders();
     }
 
     fn render_top(&mut self) {
@@ -227,7 +268,8 @@ impl App {
         let written = self.cat.books.iter().filter(|b| b.written).count();
         let marked = self.delete_marked.len();
         let mark_s = if marked > 0 { format!("  \u{00b7}  {} marked", marked) } else { String::new() };
-        let title = format!(" library   {} books \u{00b7} {} written{}", n, written, mark_s);
+        let search_s = if self.search.is_empty() { String::new() } else { format!("  \u{00b7}  /{}", self.search) };
+        let title = format!(" library   {} books \u{00b7} {} written{}{}", n, written, mark_s, search_s);
         // Right side: a live "brewing" indicator while batches generate in
         // the background. Keys live in the footer only (no duplicate map).
         let right = if self.gen_in_flight > 0 {
@@ -329,7 +371,7 @@ impl App {
 
     fn render_foot(&mut self, msg: &str) {
         let (left, color) = if msg.is_empty() {
-            (" d mark \u{00b7} < purge \u{00b7} * star \u{00b7} + more \u{00b7} s seed \u{00b7} i interests \u{00b7} w/W width \u{00b7} r reload".to_string(), C_DIM)
+            (" / find \u{00b7} d mark \u{00b7} < purge \u{00b7} * star \u{00b7} + more \u{00b7} s seed \u{00b7} i edit \u{00b7} w/W width \u{00b7} ^B border".to_string(), C_DIM)
         } else {
             (msg.to_string(), C_HEADER)
         };
@@ -455,6 +497,22 @@ impl App {
         self.render_top();
     }
 
+    /// `/` — filter the shelf across title / hook / author / category / tags.
+    /// Empty query clears the filter; ESC keeps the current one.
+    fn do_search(&mut self) {
+        let q = self.foot.ask("/", &self.search);
+        if self.foot.last_escaped { self.render_foot(""); return; }
+        self.search = q.trim().to_string();
+        self.rebuild(None);
+        self.render_all();
+        if self.search.is_empty() {
+            self.render_foot(" Search cleared.");
+        } else {
+            let n = self.entries.iter().filter(|e| matches!(e, Entry::Book(_))).count();
+            self.render_foot(&format!(" {} match(es) for \u{201c}{}\u{201d} \u{00b7} / refine \u{00b7} /\u{21b5} (empty) clears", n, self.search));
+        }
+    }
+
     fn grab(&mut self) {
         if self.selected_book_idx().is_some() {
             self.render_foot(" Reading (grab \u{2192} claude writes the book) lands in the next build.");
@@ -487,6 +545,8 @@ impl App {
                 "i" => self.edit_interests(),
                 "w" => self.cycle_width(true),
                 "W" => self.cycle_width(false),
+                "C-B" => self.cycle_border(),
+                "/" => self.do_search(),
                 "ENTER" => self.grab(),
                 "r" => {
                     self.cat = Catalog::load();
@@ -498,6 +558,14 @@ impl App {
             }
         }
     }
+}
+
+/// True if `b` matches the lowercased search `q` (empty = matches all).
+fn book_matches(b: &Book, q: &str) -> bool {
+    if q.is_empty() { return true; }
+    let hay = format!("{} {} {} {} {}",
+        b.title, b.hook, b.author, b.category, b.tags.join(" ")).to_lowercase();
+    hay.contains(q)
 }
 
 // ── small text helpers ────────────────────────────────────────────────
