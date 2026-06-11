@@ -19,6 +19,8 @@ const C_DIM:    u8 = 245;  // author / hints
 const C_SEL:    u8 = 81;   // selection highlight
 const C_DEL:    u8 = 88;   // marked-for-deletion (dark red)
 const C_REAL:   u8 = 222;  // real (existing) books — warm gold
+const C_BODY_BRIGHT: u8 = 255;  // written conjured book — bright + bold
+const C_REAL_BRIGHT: u8 = 229;  // written real book — light gold + bold
 const C_HOOK:   u8 = 250;  // hook body
 const C_TAG:    u8 = 109;  // tags
 const C_BORDER: u8 = 238;  // pane borders
@@ -313,20 +315,22 @@ impl App {
                 Entry::Book(bi) => {
                     let b = &self.cat.books[*bi];
                     let marked = self.delete_marked.contains(&b.id);
+                    let selected = idx == self.sel;
                     let star = if b.starred { '\u{2605}' } else { ' ' };
                     let flag = if marked { 'D' } else { ' ' };
-                    // One plain string, one colour per line — no nested ANSI.
                     let title = trunc(&b.title, (self.list_w as usize).saturating_sub(6));
-                    let plain = format!(" {}{} {}", star, flag, title);
-                    let base = if b.kind == BookKind::Real { C_REAL } else { C_BODY };
-                    let line = if idx == self.sel {
-                        style::reverse(&style::fg(&pad_to(&plain, self.list_w as usize), C_SEL))
-                    } else if marked {
-                        style::fg(&plain, C_DEL)
-                    } else {
-                        style::fg(&plain, base)
-                    };
-                    lines.push_str(&line);
+                    let row = format!("{}{} {}", star, flag, title);
+                    // Colour: marked = dark red; real = gold, conjured = grey;
+                    // written books are brighter + bold (you can see what you own).
+                    let color = if marked { C_DEL }
+                        else if b.kind == BookKind::Real { if b.written { C_REAL_BRIGHT } else { C_REAL } }
+                        else if b.written { C_BODY_BRIGHT } else { C_BODY };
+                    let mut styled = style::fg(&row, color);
+                    if b.written { styled = style::bold(&styled); }
+                    // Pointer-style selector: a cyan arrow + underline, no reverse.
+                    if selected { styled = style::underline(&styled); }
+                    let arrow = if selected { style::fg("\u{2192}", C_SEL) } else { " ".to_string() };
+                    lines.push_str(&format!("{} {}", arrow, styled));
                 }
             }
             lines.push('\n');
@@ -593,12 +597,12 @@ impl App {
             .map(|b| b.title.clone()).unwrap_or_default();
 
         let cols = self.cols as usize;
-        let rows = self.rows as usize;
-        let wrap_w = cols.saturating_sub(4).max(20);
-        let lines = render_markdown(&md, wrap_w);
-        let h = rows.saturating_sub(2);              // content rows 2..rows-1
-        let total = lines.len();
-        let max_top = total.saturating_sub(h);
+        let h = (self.rows as usize).saturating_sub(2); // content rows 2..rows-1
+        let max_w = cols.saturating_sub(4).max(20);
+        // Reading column width — w/W widen/narrow it (persisted). Default to a
+        // comfortable ~86 cols even on a very wide screen.
+        let mut wrap_w = if self.cat.read_w >= 40 { (self.cat.read_w as usize).min(max_w) } else { max_w.min(86) };
+        let mut lines = render_markdown(&md, wrap_w);
         let mut top = 0usize;
 
         let mut body = Pane::new(2, 2, self.cols.saturating_sub(2), self.rows.saturating_sub(2), C_BODY as u16, 0);
@@ -606,8 +610,11 @@ impl App {
         Crust::clear_screen();
 
         loop {
+            let total = lines.len();
+            let max_top = total.saturating_sub(h);
+            if top > max_top { top = max_top; }
             let pct = if max_top == 0 { 100 } else { top * 100 / max_top };
-            let tline = format!(" \u{1f4d6} {}", trunc(&title, cols.saturating_sub(16)));
+            let tline = format!(" \u{1f4d6} {}", trunc(&title, cols.saturating_sub(18)));
             let prog = format!("{}% ", pct);
             let pad = cols.saturating_sub(crust::display_width(&tline) + crust::display_width(&prog));
             self.top.say(&format!("{}{}{}",
@@ -617,7 +624,7 @@ impl App {
             body.set_text(&window);
             body.full_refresh();
 
-            self.foot.say(&style::fg(" j/k scroll \u{00b7} SPACE/b page \u{00b7} g/G start/end \u{00b7} q back", C_DIM));
+            self.foot.say(&style::fg(" j/k scroll \u{00b7} SPACE/b page \u{00b7} g/G start/end \u{00b7} w/W text width \u{00b7} q back", C_DIM));
 
             let Some(key) = Input::getchr(None) else { continue };
             match key.as_str() {
@@ -628,6 +635,13 @@ impl App {
                 "b" | "PgUP" => top = top.saturating_sub(h.saturating_sub(1)),
                 "g" | "HOME" => top = 0,
                 "G" | "END" => top = max_top,
+                "w" | "W" => {
+                    wrap_w = if key == "w" { (wrap_w + 6).min(max_w) } else { wrap_w.saturating_sub(6).max(40) };
+                    self.cat.read_w = wrap_w as u16;
+                    let _ = self.cat.save();
+                    lines = render_markdown(&md, wrap_w);
+                    Crust::clear_screen();
+                }
                 _ => {}
             }
         }
@@ -752,10 +766,6 @@ fn trunc(s: &str, max: usize) -> String {
     out
 }
 
-fn pad_to(s: &str, width: usize) -> String {
-    let w = crust::display_width(s);
-    if w >= width { s.to_string() } else { format!("{}{}", s, " ".repeat(width - w)) }
-}
 
 /// Greedy word-wrap to `width` columns.
 fn wrap(text: &str, width: usize) -> String {

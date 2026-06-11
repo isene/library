@@ -65,6 +65,9 @@ pub struct Catalog {
     /// Persisted border mode: 0 none, 1 right, 2 both, 3 left.
     #[serde(default)]
     pub border: u8,
+    /// Persisted reading-column width (columns) in the reader. 0 = default.
+    #[serde(default)]
+    pub read_w: u16,
 }
 
 pub fn home() -> PathBuf {
