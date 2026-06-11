@@ -131,6 +131,47 @@ reading\", \"tags\": [\"a\", \"few\", \"keywords\"]}}",
     parse_books(&run_claude(&prompt, CATALOG_MODEL)?)
 }
 
+const BOOK_MODEL: &str = "claude-opus-4-8";
+
+/// Write the full text of a grabbed book as Markdown. `deep` picks a
+/// short-book length over a one-sitting read.
+pub fn write_book(title: &str, hook: &str, category: &str, deep: bool) -> Result<String, String> {
+    let spec = if deep {
+        "a substantial short book of roughly 8000-12000 words across 6-9 chapters"
+    } else {
+        "a focused, satisfying read of roughly 2500-3500 words across 3-4 short chapters"
+    };
+    let prompt = format!(
+        "Write the full text of a book titled \"{title}\".\n\
+         What it is about: {hook}\n\
+         Shelf: {category}\n\n\
+         Write {spec}, for a curious, intelligent generalist reader. Make it \
+         genuinely illuminating and a pleasure to read \u{2014} vivid and \
+         concrete, well-structured, honest, never padded. Open with a hook \
+         that earns the reader's attention and close with a resonant ending.\n\n\
+         Use Markdown only: a single top-level '# {title}' heading, '## ' \
+         chapter headings, and flowing prose paragraphs (you may use *italic* \
+         and **bold** for emphasis, and '>' for the occasional pull-quote). \
+         Output ONLY the Markdown of the book itself \u{2014} no preamble, no \
+         commentary, no code fences around it.",
+        title = title, hook = hook, category = category, spec = spec
+    );
+    Ok(strip_code_fences(&run_claude(&prompt, BOOK_MODEL)?))
+}
+
+/// Defensively unwrap a whole-document ```…``` fence the model may add
+/// despite being told not to.
+fn strip_code_fences(s: &str) -> String {
+    let t = s.trim();
+    if t.starts_with("```") {
+        let mut lines: Vec<&str> = t.lines().collect();
+        lines.remove(0); // drop ``` or ```markdown
+        if lines.last().map(|l| l.trim() == "```").unwrap_or(false) { lines.pop(); }
+        return lines.join("\n");
+    }
+    s.to_string()
+}
+
 /// Generate `n` more books focused on a topic/request, in the spirit of
 /// the existing library, avoiding existing titles.
 pub fn more_like(topic: &str, interests: &str, existing: &[String], n: usize) -> Result<Vec<Book>, String> {

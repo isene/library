@@ -11,7 +11,7 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use crust::{Crust, Input, Pane, style};
 
 use crate::claude;
-use crate::store::{Book, BookKind, Catalog};
+use crate::store::{self, Book, BookKind, Catalog};
 
 const C_HEADER: u8 = 73;   // category heading (teal)
 const C_BODY:   u8 = 252;  // book title
@@ -35,6 +35,9 @@ enum Entry { Header(String), Book(usize) }
 /// interactive while batches brew, and results merge in when they land.
 type GenResult = Result<Vec<Book>, String>;
 
+/// (book id, write result) returned when a grabbed book finishes writing.
+type WriteResult = (String, Result<(), String>);
+
 pub struct App {
     cols: u16,
     rows: u16,
@@ -54,6 +57,9 @@ pub struct App {
     list_w: u16,
     border: u8,
     search: String,
+    write_tx: Sender<WriteResult>,
+    write_rx: Receiver<WriteResult>,
+    writing: HashSet<String>,
 }
 
 pub fn run() {
@@ -86,6 +92,7 @@ impl App {
         let mut foot = Pane::new(1, rows, cols, 1, C_DIM as u16, 236);
         foot.scroll = false; foot.wrap = false;
         let (gen_tx, gen_rx) = mpsc::channel();
+        let (write_tx, write_rx) = mpsc::channel();
         let mut app = App {
             cols, rows, top, left, right, foot,
             cat,
@@ -99,6 +106,8 @@ impl App {
             list_w,
             border,
             search: String::new(),
+            write_tx, write_rx,
+            writing: HashSet::new(),
         };
         app.apply_border_state();
         app.rebuild(None);
@@ -272,8 +281,12 @@ impl App {
         let title = format!(" library   {} books \u{00b7} {} written{}{}", n, written, mark_s, search_s);
         // Right side: a live "brewing" indicator while batches generate in
         // the background. Keys live in the footer only (no duplicate map).
-        let right = if self.gen_in_flight > 0 {
+        let right = if self.gen_in_flight > 0 && !self.writing.is_empty() {
+            format!("{} {} brewing \u{00b7} {} writing\u{2026} ", SPINNER[self.spin], self.gen_in_flight, self.writing.len())
+        } else if self.gen_in_flight > 0 {
             format!("{} {} brewing\u{2026} ", SPINNER[self.spin], self.gen_in_flight)
+        } else if !self.writing.is_empty() {
+            format!("{} {} writing\u{2026} ", SPINNER[self.spin], self.writing.len())
         } else {
             String::new()
         };
@@ -513,10 +526,116 @@ impl App {
         }
     }
 
+    /// `Enter` — grab the selected book. Written → open the reader. Not yet
+    /// written → kick off an async write (conjured: Claude writes it) and
+    /// keep the UI live; the book opens when you press Enter again once ready.
     fn grab(&mut self) {
-        if self.selected_book_idx().is_some() {
-            self.render_foot(" Reading (grab \u{2192} claude writes the book) lands in the next build.");
+        let Some(bi) = self.selected_book_idx() else { return; };
+        let id = self.cat.books[bi].id.clone();
+        if self.cat.books[bi].written && store::book_md(&id).exists() {
+            self.read_book(&id);
+            return;
         }
+        if self.writing.contains(&id) {
+            self.render_foot(" Still writing this one\u{2026} keep browsing; \u{21b5} again when it's ready.");
+            return;
+        }
+        if self.cat.books[bi].kind == BookKind::Real {
+            self.render_foot(" Real-book fetching lands next \u{2014} grab a conjured book for now.");
+            return;
+        }
+        let ans = self.foot.ask("Depth \u{2014} [q]uick read / [d]eep dive: ", "q");
+        if self.foot.last_escaped { self.render_foot(""); return; }
+        let deep = ans.trim().to_lowercase().starts_with('d');
+        let b = &self.cat.books[bi];
+        let (title, hook, category) = (b.title.clone(), b.hook.clone(), b.category.clone());
+        let tx = self.write_tx.clone();
+        let wid = id.clone();
+        self.writing.insert(id);
+        std::thread::spawn(move || {
+            let res = claude::write_book(&title, &hook, &category, deep).and_then(|md| {
+                std::fs::create_dir_all(store::book_dir(&wid)).map_err(|e| e.to_string())?;
+                std::fs::write(store::book_md(&wid), md).map_err(|e| e.to_string())
+            });
+            let _ = tx.send((wid, res));
+        });
+        self.render_top();
+        self.render_foot(" Writing your book in the background \u{2014} keep browsing; \u{21b5} when it's ready.");
+    }
+
+    /// Collect finished book writes (non-blocking): mark written + toast.
+    fn drain_writes(&mut self) {
+        while let Ok((id, res)) = self.write_rx.try_recv() {
+            self.writing.remove(&id);
+            match res {
+                Ok(()) => {
+                    let mut title = String::new();
+                    if let Some(b) = self.cat.books.iter_mut().find(|b| b.id == id) {
+                        b.written = true;
+                        title = b.title.clone();
+                    }
+                    let _ = self.cat.save();
+                    self.rebuild(None);
+                    self.render_all();
+                    self.render_foot(&format!(" \u{201c}{}\u{201d} is ready \u{2014} press \u{21b5} to read.", trunc(&title, 48)));
+                }
+                Err(e) => self.render_foot(&format!(" Book writing failed: {}", e)),
+            }
+        }
+    }
+
+    /// Full-screen reader: top bar = title + progress, body = the book,
+    /// status bar = keys. Paginated scroll over the rendered Markdown.
+    fn read_book(&mut self, id: &str) {
+        let md = std::fs::read_to_string(store::book_md(id)).unwrap_or_default();
+        if md.trim().is_empty() { self.render_foot(" (book is empty)"); return; }
+        let title = self.cat.books.iter().find(|b| b.id == id)
+            .map(|b| b.title.clone()).unwrap_or_default();
+
+        let cols = self.cols as usize;
+        let rows = self.rows as usize;
+        let wrap_w = cols.saturating_sub(4).max(20);
+        let lines = render_markdown(&md, wrap_w);
+        let h = rows.saturating_sub(2);              // content rows 2..rows-1
+        let total = lines.len();
+        let max_top = total.saturating_sub(h);
+        let mut top = 0usize;
+
+        let mut body = Pane::new(2, 2, self.cols.saturating_sub(2), self.rows.saturating_sub(2), C_BODY as u16, 0);
+        body.scroll = false; body.wrap = false;
+        Crust::clear_screen();
+
+        loop {
+            let pct = if max_top == 0 { 100 } else { top * 100 / max_top };
+            let tline = format!(" \u{1f4d6} {}", trunc(&title, cols.saturating_sub(16)));
+            let prog = format!("{}% ", pct);
+            let pad = cols.saturating_sub(crust::display_width(&tline) + crust::display_width(&prog));
+            self.top.say(&format!("{}{}{}",
+                style::bold(&style::fg(&tline, C_SEL)), " ".repeat(pad), style::fg(&prog, C_DIM)));
+
+            let window = lines[top..(top + h).min(total)].join("\n");
+            body.set_text(&window);
+            body.full_refresh();
+
+            self.foot.say(&style::fg(" j/k scroll \u{00b7} SPACE/b page \u{00b7} g/G start/end \u{00b7} q back", C_DIM));
+
+            let Some(key) = Input::getchr(None) else { continue };
+            match key.as_str() {
+                "q" | "ESC" | "h" | "LEFT" => break,
+                "j" | "DOWN" => if top < max_top { top += 1; },
+                "k" | "UP" => top = top.saturating_sub(1),
+                " " | "PgDOWN" | "f" => top = (top + h.saturating_sub(1)).min(max_top),
+                "b" | "PgUP" => top = top.saturating_sub(h.saturating_sub(1)),
+                "g" | "HOME" => top = 0,
+                "G" | "END" => top = max_top,
+                _ => {}
+            }
+        }
+
+        Crust::clear_screen();
+        self.top.invalidate();
+        self.foot.invalidate();
+        self.render_all();
     }
 
     fn run(&mut self) {
@@ -524,11 +643,13 @@ impl App {
             // Block forever when idle (zero idle wakeups); while batches are
             // brewing, wake every second to tick the spinner and collect
             // finished work — so the UI stays fully interactive throughout.
-            let timeout = if self.gen_in_flight > 0 { Some(1) } else { None };
+            let busy = self.gen_in_flight > 0 || !self.writing.is_empty();
+            let timeout = if busy { Some(1) } else { None };
             let key = Input::getchr(timeout);
             self.drain_generations();
+            self.drain_writes();
             let Some(key) = key else {
-                if self.gen_in_flight > 0 { self.tick_spinner(); }
+                if self.gen_in_flight > 0 || !self.writing.is_empty() { self.tick_spinner(); }
                 continue;
             };
             match key.as_str() {
@@ -558,6 +679,54 @@ impl App {
             }
         }
     }
+}
+
+/// Render a book's Markdown into styled, wrapped display lines for the
+/// reader. Headings are coloured/bold; `>` lines are dimmed pull-quotes;
+/// body paragraphs wrap to `width` with inline **bold** / *italic*.
+fn render_markdown(md: &str, width: usize) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for raw in md.lines() {
+        let line = raw.trim_end();
+        if let Some(t) = line.strip_prefix("# ") {
+            out.push(String::new());
+            out.push(style::bold(&style::fg(t.trim(), C_SEL)));
+            out.push(String::new());
+        } else if let Some(t) = line.strip_prefix("## ") {
+            out.push(String::new());
+            out.push(style::bold(&style::fg(t.trim(), C_HEADER)));
+            out.push(String::new());
+        } else if let Some(t) = line.strip_prefix("### ") {
+            out.push(style::bold(&style::fg(t.trim(), C_TAG)));
+        } else if let Some(t) = line.strip_prefix("> ") {
+            for wl in wrap(t.trim(), width.saturating_sub(2)).lines() {
+                out.push(format!("  {}", style::italic(&style::fg(wl, C_DIM))));
+            }
+        } else if line.trim().is_empty() {
+            out.push(String::new());
+        } else {
+            for wl in wrap(line, width).lines() {
+                out.push(style::fg(&style_inline(wl), C_HOOK));
+            }
+        }
+    }
+    out
+}
+
+/// Apply inline **bold** then *italic*. Crust's bold/italic reset only
+/// their own attribute, so this nests cleanly inside an outer fg().
+fn style_inline(s: &str) -> String {
+    let bolded = toggle_wrap(s, "**", style::bold);
+    toggle_wrap(&bolded, "*", style::italic)
+}
+
+fn toggle_wrap(s: &str, marker: &str, f: fn(&str) -> String) -> String {
+    if !s.contains(marker) { return s.to_string(); }
+    let mut out = String::new();
+    for (i, part) in s.split(marker).enumerate() {
+        if i % 2 == 1 { out.push_str(&f(part)); } else { out.push_str(part); }
+    }
+    out
 }
 
 /// True if `b` matches the lowercased search `q` (empty = matches all).
