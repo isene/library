@@ -316,19 +316,19 @@ impl App {
                     let b = &self.cat.books[*bi];
                     let marked = self.delete_marked.contains(&b.id);
                     let selected = idx == self.sel;
-                    let star = if b.starred { '\u{2605}' } else { ' ' };
-                    let flag = if marked { 'D' } else { ' ' };
-                    let title = trunc(&b.title, (self.list_w as usize).saturating_sub(6));
-                    let row = format!("{}{} {}", star, flag, title);
+                    let title = trunc(&b.title, (self.list_w as usize).saturating_sub(4));
+                    // Star sits tight against the title — no padding columns to
+                    // get swept under the selection underline.
+                    let content = if b.starred { format!("\u{2605} {}", title) } else { title };
                     // Colour: marked = dark red; real = gold, conjured = grey;
                     // written books are brighter + bold (you can see what you own).
                     let color = if marked { C_DEL }
                         else if b.kind == BookKind::Real { if b.written { C_REAL_BRIGHT } else { C_REAL } }
                         else if b.written { C_BODY_BRIGHT } else { C_BODY };
-                    let mut styled = style::fg(&row, color);
+                    let mut styled = style::fg(&content, color);
                     if b.written { styled = style::bold(&styled); }
-                    // Pointer-style selector: a cyan arrow + underline, no reverse.
                     if selected { styled = style::underline(&styled); }
+                    // Pointer-style: a cyan arrow, one plain space, the title.
                     let arrow = if selected { style::fg("\u{2192}", C_SEL) } else { " ".to_string() };
                     lines.push_str(&format!("{} {}", arrow, styled));
                 }
