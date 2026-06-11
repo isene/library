@@ -46,6 +46,7 @@ pub struct App {
     gen: GenSlot,
     generating: bool,
     spin: usize,
+    list_w: u16,
 }
 
 pub fn run() {
@@ -62,18 +63,20 @@ pub fn run() {
 impl App {
     fn new() -> Self {
         let (cols, rows) = Crust::terminal_size();
+        let cat = Catalog::load();
         let body_h = rows.saturating_sub(3);
+        let list_w = if cat.list_w >= 24 && cat.list_w + 24 < cols { cat.list_w } else { LIST_W.min(cols.saturating_sub(24)) };
         let mut top = Pane::new(1, 1, cols, 1, C_SEL as u16, 236);
         top.scroll = false; top.wrap = false;
-        let mut left = Pane::new(1, 3, LIST_W, body_h, C_BODY as u16, 0);
+        let mut left = Pane::new(1, 3, list_w, body_h, C_BODY as u16, 0);
         left.scroll = false; left.wrap = false;
-        let mut right = Pane::new(LIST_W + 2, 3, cols.saturating_sub(LIST_W + 1), body_h, C_BODY as u16, 0);
+        let mut right = Pane::new(list_w + 2, 3, cols.saturating_sub(list_w + 1), body_h, C_BODY as u16, 0);
         right.scroll = false; right.wrap = false;
         let mut foot = Pane::new(1, rows, cols, 1, C_DIM as u16, 236);
         foot.scroll = false; foot.wrap = false;
         let mut app = App {
             cols, rows, top, left, right, foot,
-            cat: Catalog::load(),
+            cat,
             entries: Vec::new(),
             sel: 0,
             top_row: 0,
@@ -81,9 +84,65 @@ impl App {
             gen: Arc::new(Mutex::new(None)),
             generating: false,
             spin: 0,
+            list_w,
         };
         app.rebuild(None);
         app
+    }
+
+    /// Recompute pane geometry after a width change and repaint clean.
+    fn relayout(&mut self) {
+        self.left.w = self.list_w;
+        self.right.x = self.list_w + 2;
+        self.right.w = self.cols.saturating_sub(self.list_w + 1);
+        Crust::clear_screen();
+        self.top.invalidate();
+        self.foot.invalidate();
+        self.render_all();
+    }
+
+    /// `w` / `W` — widen / narrow the shelf list (persisted), like
+    /// pointer/kastrup. Clamped so both panes stay usable.
+    fn cycle_width(&mut self, wider: bool) {
+        let step = 4u16;
+        let min = 24u16;
+        let max = self.cols.saturating_sub(24);
+        let new = if wider { self.list_w.saturating_add(step) } else { self.list_w.saturating_sub(step) };
+        self.list_w = new.clamp(min, max.max(min));
+        self.cat.list_w = self.list_w;
+        let _ = self.cat.save();
+        self.relayout();
+    }
+
+    /// `i` — edit the library's interests in $EDITOR (scribe), then save.
+    /// New books (s / +) are generated to match. Never deletes books.
+    fn edit_interests(&mut self) {
+        let tmp = format!("/tmp/library_interests_{}.txt", std::process::id());
+        let header = "# Your library interests — edit freely, then save & quit.\n\
+                      # New books (s = seed, + = more) are generated to match this.\n\
+                      # Lines starting with # are ignored.\n\n";
+        let _ = std::fs::write(&tmp, format!("{}{}", header, self.cat.interests));
+        let editor = std::env::var("EDITOR").unwrap_or_else(|_| "scribe".into());
+        Crust::cleanup();
+        let _ = std::process::Command::new("sh").arg("-c")
+            .arg(format!("{} {}", editor, crust::shell_escape(&tmp)))
+            .status();
+        Crust::init();
+        Crust::set_app_identity("Library");
+        Crust::clear_screen();
+        if let Ok(edited) = std::fs::read_to_string(&tmp) {
+            let cleaned = edited.lines()
+                .filter(|l| !l.trim_start().starts_with('#'))
+                .collect::<Vec<_>>().join("\n")
+                .trim().to_string();
+            if cleaned != self.cat.interests {
+                self.cat.interests = cleaned;
+                let _ = self.cat.save();
+            }
+        }
+        let _ = std::fs::remove_file(&tmp);
+        self.render_all();
+        self.render_foot(" Interests saved. Press s / + to grow the shelf to match.");
     }
 
     /// Rebuild the display list from the catalog (category heading then
@@ -191,11 +250,11 @@ impl App {
                     let star = if b.starred { '\u{2605}' } else { ' ' };
                     let flag = if marked { 'D' } else { ' ' };
                     // One plain string, one colour per line — no nested ANSI.
-                    let title = trunc(&b.title, (LIST_W as usize).saturating_sub(6));
+                    let title = trunc(&b.title, (self.list_w as usize).saturating_sub(6));
                     let plain = format!(" {}{} {}", star, flag, title);
                     let base = if b.kind == BookKind::Real { C_REAL } else { C_BODY };
                     let line = if idx == self.sel {
-                        style::reverse(&style::fg(&pad_to(&plain, LIST_W as usize), C_SEL))
+                        style::reverse(&style::fg(&pad_to(&plain, self.list_w as usize), C_SEL))
                     } else if marked {
                         style::fg(&plain, C_DEL)
                     } else {
@@ -257,7 +316,7 @@ impl App {
 
     fn render_foot(&mut self, msg: &str) {
         if msg.is_empty() {
-            self.foot.say(&style::fg(" d mark \u{00b7} < purge \u{00b7} * star \u{00b7} + more on a topic \u{00b7} s (re)seed \u{00b7} r reload \u{00b7} g/G top/bottom", C_DIM));
+            self.foot.say(&style::fg(" d mark \u{00b7} < purge \u{00b7} * star \u{00b7} + more \u{00b7} s seed \u{00b7} i interests \u{00b7} w/W width \u{00b7} r reload", C_DIM));
         } else {
             self.foot.say(&style::fg(msg, C_HEADER));
         }
@@ -384,6 +443,9 @@ impl App {
                 "<" => self.purge_marked(),
                 "+" => self.request_more(false),
                 "s" => self.request_more(true),
+                "i" => self.edit_interests(),
+                "w" => self.cycle_width(true),
+                "W" => self.cycle_width(false),
                 "ENTER" => self.grab(),
                 "r" => {
                     self.cat = Catalog::load();

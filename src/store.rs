@@ -59,6 +59,9 @@ pub struct Catalog {
     pub interests: String,
     #[serde(default)]
     pub books: Vec<Book>,
+    /// Persisted shelf-list pane width (columns). 0 = use the default.
+    #[serde(default)]
+    pub list_w: u16,
 }
 
 pub fn home() -> PathBuf {
