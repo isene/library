@@ -551,20 +551,41 @@ impl App {
         let ans = self.foot.ask("Depth \u{2014} [q]uick read / [d]eep dive: ", "q");
         if self.foot.last_escaped { self.render_foot(""); return; }
         let deep = ans.trim().to_lowercase().starts_with('d');
-        let b = &self.cat.books[bi];
-        let (title, hook, category) = (b.title.clone(), b.hook.clone(), b.category.clone());
-        let tx = self.write_tx.clone();
-        let wid = id.clone();
-        self.writing.insert(id);
-        std::thread::spawn(move || {
-            let res = claude::write_book(&title, &hook, &category, deep).and_then(|md| {
-                std::fs::create_dir_all(store::book_dir(&wid)).map_err(|e| e.to_string())?;
-                std::fs::write(store::book_md(&wid), md).map_err(|e| e.to_string())
-            });
-            let _ = tx.send((wid, res));
-        });
+        self.cat.books[bi].deep = deep;
+        let _ = self.cat.save();
+        self.write_book_async(bi, deep);
         self.render_top();
         self.render_foot(" Writing your book in the background \u{2014} keep browsing; \u{21b5} when it's ready.");
+    }
+
+    /// Spawn the async book write for `bi` (conjured book). Parses the
+    /// response into Markdown + SVG figures, renders the figures to PNG.
+    fn write_book_async(&mut self, bi: usize, deep: bool) {
+        let b = &self.cat.books[bi];
+        let (id, title, hook, category) = (b.id.clone(), b.title.clone(), b.hook.clone(), b.category.clone());
+        let tx = self.write_tx.clone();
+        self.writing.insert(id.clone());
+        std::thread::spawn(move || {
+            let res = claude::write_book(&title, &hook, &category, deep).and_then(|raw| {
+                let (md, figs) = claude::parse_book(&raw);
+                std::fs::create_dir_all(store::book_dir(&id)).map_err(|e| e.to_string())?;
+                std::fs::write(store::book_md(&id), md).map_err(|e| e.to_string())?;
+                let img = store::book_img_dir(&id);
+                let _ = std::fs::create_dir_all(&img);
+                for (n, svg) in figs {
+                    let svg_path = img.join(format!("fig{}.svg", n));
+                    if std::fs::write(&svg_path, &svg).is_ok() {
+                        let png_path = img.join(format!("fig{}.png", n));
+                        let _ = std::process::Command::new("rsvg-convert")
+                            .args(["-w", "900"]).arg(&svg_path)
+                            .arg("-o").arg(&png_path)
+                            .status();
+                    }
+                }
+                Ok(())
+            });
+            let _ = tx.send((id, res));
+        });
     }
 
     /// Collect finished book writes (non-blocking): mark written + toast.
@@ -596,35 +617,61 @@ impl App {
         let title = self.cat.books.iter().find(|b| b.id == id)
             .map(|b| b.title.clone()).unwrap_or_default();
 
+        let is_deep = self.cat.books.iter().find(|b| b.id == id).map(|b| b.deep).unwrap_or(false);
+        let img_dir = store::book_img_dir(id);
+        let mut display = glow::Display::new();
+        let images_ok = display.supported();
+        let term_w = self.cols;
+        let term_h = self.rows;
         let cols = self.cols as usize;
         let h = (self.rows as usize).saturating_sub(2); // content rows 2..rows-1
         let max_w = cols.saturating_sub(4).max(20);
-        // Reading column width — w/W widen/narrow it (persisted). Default to a
-        // comfortable ~86 cols even on a very wide screen.
         let mut wrap_w = if self.cat.read_w >= 40 { (self.cat.read_w as usize).min(max_w) } else { max_w.min(86) };
-        let mut lines = render_markdown(&md, wrap_w);
+        let (mut lines, mut figs) = render_markdown(&md, wrap_w, &img_dir, images_ok);
         let mut top = 0usize;
+        let mut shown: Vec<(u16, u16, u16, u16)> = Vec::new();
 
         let mut body = Pane::new(2, 2, self.cols.saturating_sub(2), self.rows.saturating_sub(2), C_BODY as u16, 0);
         body.scroll = false; body.wrap = false;
         Crust::clear_screen();
 
+        let mut extend = false;
         loop {
             let total = lines.len();
             let max_top = total.saturating_sub(h);
             if top > max_top { top = max_top; }
             let pct = if max_top == 0 { 100 } else { top * 100 / max_top };
-            let tline = format!(" \u{1f4d6} {}", trunc(&title, cols.saturating_sub(18)));
+            let depth_tag = if is_deep { " [deep]" } else { "" };
+            let tline = format!(" \u{1f4d6} {}{}", trunc(&title, cols.saturating_sub(24)), depth_tag);
             let prog = format!("{}% ", pct);
             let pad = cols.saturating_sub(crust::display_width(&tline) + crust::display_width(&prog));
             self.top.say(&format!("{}{}{}",
                 style::bold(&style::fg(&tline, C_SEL)), " ".repeat(pad), style::fg(&prog, C_DIM)));
 
+            // Clear images from the previous frame before repainting text.
+            for (x, y, w, hh) in shown.drain(..) { display.clear(x, y, w, hh, term_w, term_h); }
+
             let window = lines[top..(top + h).min(total)].join("\n");
             body.set_text(&window);
             body.full_refresh();
 
-            self.foot.say(&style::fg(" j/k scroll \u{00b7} SPACE/b page \u{00b7} g/G start/end \u{00b7} w/W text width \u{00b7} q back", C_DIM));
+            let ext_hint = if is_deep { "" } else { " \u{00b7} + extend to deep" };
+            self.foot.say(&style::fg(&format!(" j/k scroll \u{00b7} SPACE/b page \u{00b7} g/G \u{00b7} w/W width{} \u{00b7} q back", ext_hint), C_DIM));
+
+            // Show figures fully inside the current view.
+            if images_ok {
+                for fig in &figs {
+                    if fig.line >= top && fig.line + fig.rows <= top + h {
+                        let x = 4u16;
+                        let y = 2 + (fig.line - top) as u16;
+                        let w = wrap_w.min(max_w) as u16;
+                        let hh = fig.rows as u16;
+                        if display.show(&fig.png.to_string_lossy(), x, y, w, hh) {
+                            shown.push((x, y, w, hh));
+                        }
+                    }
+                }
+            }
 
             let Some(key) = Input::getchr(None) else { continue };
             match key.as_str() {
@@ -639,16 +686,31 @@ impl App {
                     wrap_w = if key == "w" { (wrap_w + 6).min(max_w) } else { wrap_w.saturating_sub(6).max(40) };
                     self.cat.read_w = wrap_w as u16;
                     let _ = self.cat.save();
-                    lines = render_markdown(&md, wrap_w);
+                    let (l, f) = render_markdown(&md, wrap_w, &img_dir, images_ok);
+                    lines = l; figs = f;
+                    for (x, y, w, hh) in shown.drain(..) { display.clear(x, y, w, hh, term_w, term_h); }
                     Crust::clear_screen();
                 }
+                "+" if !is_deep => { extend = true; break; }
                 _ => {}
             }
         }
 
+        for (x, y, w, hh) in shown.drain(..) { display.clear(x, y, w, hh, term_w, term_h); }
         Crust::clear_screen();
         self.top.invalidate();
         self.foot.invalidate();
+
+        if extend {
+            if let Some(bi) = self.cat.books.iter().position(|b| b.id == id) {
+                self.cat.books[bi].deep = true;
+                let _ = self.cat.save();
+                self.write_book_async(bi, true);
+                self.render_all();
+                self.render_foot(" Extending into a full deep-dive in the background \u{2014} \u{21b5} when ready.");
+                return;
+            }
+        }
         self.render_all();
     }
 
@@ -695,13 +757,47 @@ impl App {
     }
 }
 
-/// Render a book's Markdown into styled, wrapped display lines for the
-/// reader. Headings are coloured/bold; `>` lines are dimmed pull-quotes;
+/// A figure to render inline in the reader: its top line in the rendered
+/// text, the PNG to show, and how many rows it reserves.
+struct FigPos { line: usize, png: std::path::PathBuf, rows: usize }
+
+const FIG_ROWS: usize = 18;
+
+/// Render a book's Markdown into styled, wrapped display lines plus the
+/// inline figures. Headings are coloured/bold; `>` lines are dimmed
+/// pull-quotes; `[[FIG n: caption]]` reserves space + records the figure;
 /// body paragraphs wrap to `width` with inline **bold** / *italic*.
-fn render_markdown(md: &str, width: usize) -> Vec<String> {
+fn render_markdown(md: &str, width: usize, img_dir: &std::path::Path, images_ok: bool)
+    -> (Vec<String>, Vec<FigPos>)
+{
     let mut out: Vec<String> = Vec::new();
+    let mut figs: Vec<FigPos> = Vec::new();
     for raw in md.lines() {
         let line = raw.trim_end();
+        let trimmed = line.trim();
+        if let Some(inner) = trimmed.strip_prefix("[[FIG").and_then(|r| r.strip_suffix("]]")) {
+            let inner = inner.trim();
+            let (n_str, caption) = match inner.split_once(':') {
+                Some((n, c)) => (n.trim(), c.trim()),
+                None => (inner, ""),
+            };
+            if let Ok(n) = n_str.parse::<usize>() {
+                let png = img_dir.join(format!("fig{}.png", n));
+                let cap = if caption.is_empty() { format!("Figure {}", n) }
+                          else { format!("Figure {}: {}", n, caption) };
+                out.push(String::new());
+                out.push(style::fg(&format!("   \u{2014} {} \u{2014}", cap), C_TAG));
+                if images_ok && png.exists() {
+                    let start = out.len();
+                    for _ in 0..FIG_ROWS { out.push(String::new()); }
+                    figs.push(FigPos { line: start, png, rows: FIG_ROWS });
+                } else if !png.exists() {
+                    out.push(style::fg("   (figure unavailable)", C_DIM));
+                }
+                out.push(String::new());
+                continue;
+            }
+        }
         if let Some(t) = line.strip_prefix("# ") {
             out.push(String::new());
             out.push(style::bold(&style::fg(t.trim(), C_SEL)));
@@ -716,7 +812,7 @@ fn render_markdown(md: &str, width: usize) -> Vec<String> {
             for wl in wrap(t.trim(), width.saturating_sub(2)).lines() {
                 out.push(format!("  {}", style::italic(&style::fg(wl, C_DIM))));
             }
-        } else if line.trim().is_empty() {
+        } else if trimmed.is_empty() {
             out.push(String::new());
         } else {
             for wl in wrap(line, width).lines() {
@@ -724,7 +820,7 @@ fn render_markdown(md: &str, width: usize) -> Vec<String> {
             }
         }
     }
-    out
+    (out, figs)
 }
 
 /// Apply inline **bold** then *italic*. Crust's bold/italic reset only

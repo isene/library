@@ -48,6 +48,9 @@ pub struct Book {
     pub starred: bool,
     #[serde(default)]
     pub written: bool,
+    /// True if the written content is the longer "deep dive" form.
+    #[serde(default)]
+    pub deep: bool,
     #[serde(default)]
     pub created_at: i64,
 }
@@ -78,6 +81,7 @@ pub fn catalog_path() -> PathBuf { root().join("catalog.json") }
 pub fn books_dir() -> PathBuf { root().join("books") }
 pub fn book_dir(id: &str) -> PathBuf { books_dir().join(id) }
 pub fn book_md(id: &str) -> PathBuf { book_dir(id).join("book.md") }
+pub fn book_img_dir(id: &str) -> PathBuf { book_dir(id).join("img") }
 
 pub fn now_secs() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH)

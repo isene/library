@@ -149,14 +149,59 @@ pub fn write_book(title: &str, hook: &str, category: &str, deep: bool) -> Result
          genuinely illuminating and a pleasure to read \u{2014} vivid and \
          concrete, well-structured, honest, never padded. Open with a hook \
          that earns the reader's attention and close with a resonant ending.\n\n\
-         Use Markdown only: a single top-level '# {title}' heading, '## ' \
-         chapter headings, and flowing prose paragraphs (you may use *italic* \
-         and **bold** for emphasis, and '>' for the occasional pull-quote). \
-         Output ONLY the Markdown of the book itself \u{2014} no preamble, no \
-         commentary, no code fences around it.",
+         Use Markdown: a single top-level '# {title}' heading, '## ' chapter \
+         headings, flowing prose paragraphs (*italic*, **bold**, and '>' \
+         pull-quotes are fine).\n\n\
+         ILLUSTRATIONS: include 2-4 simple, genuinely useful figures \u{2014} \
+         clean diagrams/schematics that aid understanding, never decoration. \
+         In the prose, put a marker line `[[FIG n: short caption]]` on its own \
+         line exactly where each figure belongs (n = 1,2,3...). Then, AFTER the \
+         entire book, output a line `===FIGURES===`, and for each figure a line \
+         `---FIG n---` followed by a complete standalone `<svg ...>...</svg>` \
+         (set a viewBox; no external refs/images/fonts; design for a DARK \
+         background \u{2014} use light strokes/text, e.g. stroke=\"#ddd\" \
+         fill=\"none\" or light fills, transparent background; keep it legible \
+         and not too wide, roughly 640x400).\n\n\
+         Output ONLY the book Markdown, then the figures block \u{2014} no \
+         preamble, no commentary, no code fences.",
         title = title, hook = hook, category = category, spec = spec
     );
     Ok(strip_code_fences(&run_claude(&prompt, BOOK_MODEL)?))
+}
+
+/// Split a book-writer response into (markdown, [(n, svg)]). The figures
+/// follow a `===FIGURES===` divider, each introduced by `---FIG n---`.
+pub fn parse_book(raw: &str) -> (String, Vec<(usize, String)>) {
+    let (md, figs_part) = match raw.split_once("===FIGURES===") {
+        Some((a, b)) => (a.trim_end().to_string(), b),
+        None => return (raw.trim().to_string(), Vec::new()),
+    };
+    let mut figs = Vec::new();
+    // Each figure: a "---FIG n---" header then its SVG up to the next header.
+    let mut current_n: Option<usize> = None;
+    let mut buf = String::new();
+    let flush = |n: Option<usize>, buf: &str, figs: &mut Vec<(usize, String)>| {
+        if let Some(n) = n {
+            if let Some(start) = buf.find("<svg") {
+                if let Some(end) = buf.rfind("</svg>") {
+                    figs.push((n, buf[start..end + 6].to_string()));
+                }
+            }
+        }
+    };
+    for line in figs_part.lines() {
+        let t = line.trim();
+        if let Some(rest) = t.strip_prefix("---FIG").and_then(|r| r.strip_suffix("---")) {
+            flush(current_n, &buf, &mut figs);
+            buf.clear();
+            current_n = rest.trim().parse::<usize>().ok();
+        } else {
+            buf.push_str(line);
+            buf.push('\n');
+        }
+    }
+    flush(current_n, &buf, &mut figs);
+    (md, figs)
 }
 
 /// Defensively unwrap a whole-document ```…``` fence the model may add
