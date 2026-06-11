@@ -71,6 +71,11 @@ pub struct Catalog {
     /// Persisted reading-column width (columns) in the reader. 0 = default.
     #[serde(default)]
     pub read_w: u16,
+    /// Optional custom real-book fetch command (shell template; placeholders
+    /// @title @author @isbn). Empty = use the built-in legal sources
+    /// (Project Gutenberg full text, else a Claude reader's companion).
+    #[serde(default)]
+    pub fetch_cmd: String,
 }
 
 pub fn home() -> PathBuf {

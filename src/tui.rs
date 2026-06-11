@@ -545,7 +545,9 @@ impl App {
             return;
         }
         if self.cat.books[bi].kind == BookKind::Real {
-            self.render_foot(" Real-book fetching lands next \u{2014} grab a conjured book for now.");
+            self.fetch_book_async(bi);
+            self.render_top();
+            self.render_foot(" Fetching this book in the background \u{2014} keep browsing; \u{21b5} when it's ready.");
             return;
         }
         let ans = self.foot.ask("Depth \u{2014} [q]uick read / [d]eep dive: ", "q");
@@ -584,6 +586,22 @@ impl App {
                 }
                 Ok(())
             });
+            let _ = tx.send((id, res));
+        });
+    }
+
+    /// Fetch a REAL book in the background: a custom source command if
+    /// configured, else Project Gutenberg full text, else a Claude reader's
+    /// companion. Reuses the write channel/`writing` set.
+    fn fetch_book_async(&mut self, bi: usize) {
+        let b = &self.cat.books[bi];
+        let (id, title, author, year, isbn) =
+            (b.id.clone(), b.title.clone(), b.author.clone(), b.year.clone(), b.isbn.clone());
+        let fetch_cmd = self.cat.fetch_cmd.clone();
+        let tx = self.write_tx.clone();
+        self.writing.insert(id.clone());
+        std::thread::spawn(move || {
+            let res = fetch_real_book(&id, &title, &author, &year, &isbn, &fetch_cmd);
             let _ = tx.send((id, res));
         });
     }
@@ -655,8 +673,8 @@ impl App {
             body.set_text(&window);
             body.full_refresh();
 
-            let ext_hint = if is_deep { "" } else { " \u{00b7} + extend to deep" };
-            self.foot.say(&style::fg(&format!(" j/k scroll \u{00b7} SPACE/b page \u{00b7} g/G \u{00b7} w/W width{} \u{00b7} q back", ext_hint), C_DIM));
+            let ext_hint = if is_deep { "" } else { " \u{00b7} + deepen" };
+            self.foot.say(&style::fg(&format!(" j/k \u{00b7} SPACE/b \u{00b7} g/G \u{00b7} w/W width \u{00b7} d define{} \u{00b7} q back", ext_hint), C_DIM));
 
             // Show figures fully inside the current view.
             if images_ok {
@@ -690,6 +708,34 @@ impl App {
                     lines = l; figs = f;
                     for (x, y, w, hh) in shown.drain(..) { display.clear(x, y, w, hh, term_w, term_h); }
                     Crust::clear_screen();
+                }
+                "d" => {
+                    let phrase = self.foot.ask("Define: ", "");
+                    let phrase = phrase.trim().to_string();
+                    if !self.foot.last_escaped && !phrase.is_empty() {
+                        let ctx: String = lines[top..(top + h).min(total)].iter()
+                            .map(|l| crust::strip_ansi(l)).collect::<Vec<_>>().join("\n");
+                        for (x, y, w, hh) in shown.drain(..) { display.clear(x, y, w, hh, term_w, term_h); }
+                        self.foot.say(&style::fg(&format!(" defining \u{201c}{}\u{201d}\u{2026}", phrase), C_DIM));
+                        match claude::define(&phrase, &ctx) {
+                            Ok(def) => {
+                                Crust::clear_screen();
+                                let mut dl = vec![String::new(),
+                                    format!("  {}", style::bold(&style::fg(&phrase, C_SEL))), String::new()];
+                                for wl in wrap(def.trim(), wrap_w).lines() {
+                                    dl.push(format!("  {}", style::fg(wl, C_HOOK)));
+                                }
+                                dl.push(String::new());
+                                dl.push(style::fg("  (any key returns to the book)", C_DIM));
+                                body.set_text(&dl.join("\n"));
+                                body.full_refresh();
+                                self.foot.say(&style::fg(" definition \u{00b7} any key returns", C_DIM));
+                                let _ = Input::getchr(None);
+                                Crust::clear_screen();
+                            }
+                            Err(e) => self.render_foot(&format!(" define failed: {}", e)),
+                        }
+                    }
                 }
                 "+" if !is_deep => { extend = true; break; }
                 _ => {}
@@ -837,6 +883,76 @@ fn toggle_wrap(s: &str, marker: &str, f: fn(&str) -> String) -> String {
         if i % 2 == 1 { out.push_str(&f(part)); } else { out.push_str(part); }
     }
     out
+}
+
+/// Fetch a real book to `books/<id>/book.md`. Custom source command if
+/// configured, else Project Gutenberg full text, else a Claude reader's
+/// companion. Legal-first — never pirated full text.
+fn fetch_real_book(id: &str, title: &str, author: &str, year: &str, isbn: &str, fetch_cmd: &str)
+    -> Result<(), String>
+{
+    std::fs::create_dir_all(store::book_dir(id)).map_err(|e| e.to_string())?;
+    if !fetch_cmd.trim().is_empty() {
+        let cmd = fetch_cmd.replace("@title", title).replace("@author", author).replace("@isbn", isbn);
+        if let Ok(out) = std::process::Command::new("sh").arg("-c").arg(&cmd).output() {
+            if out.status.success() && !out.stdout.is_empty() {
+                std::fs::write(store::book_md(id), &out.stdout).map_err(|e| e.to_string())?;
+                return Ok(());
+            }
+        }
+    }
+    if let Some(text) = gutenberg_text(title, author) {
+        let md = format!("# {}\n\n*Full text \u{2014} Project Gutenberg (public domain).*\n\n{}", title, text);
+        std::fs::write(store::book_md(id), md).map_err(|e| e.to_string())?;
+        return Ok(());
+    }
+    let md = crate::claude::reader_companion(title, author, year)?;
+    std::fs::write(store::book_md(id), md).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Search Project Gutenberg (gutendex) and return the plain-text body of a
+/// matching public-domain edition, if any.
+fn gutenberg_text(title: &str, author: &str) -> Option<String> {
+    let out = std::process::Command::new("curl")
+        .args(["-s", "--max-time", "20", "-G", "--data-urlencode"])
+        .arg(format!("search={} {}", title, author))
+        .arg("https://gutendex.com/books")
+        .output().ok()?;
+    if !out.status.success() { return None; }
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
+    for r in json.get("results")?.as_array()? {
+        let rtitle = r.get("title").and_then(|v| v.as_str()).unwrap_or("");
+        if !title_matches(title, rtitle) { continue; }
+        let Some(formats) = r.get("formats").and_then(|f| f.as_object()) else { continue };
+        let Some(url) = formats.iter()
+            .find(|(k, _)| k.starts_with("text/plain"))
+            .and_then(|(_, v)| v.as_str()) else { continue };
+        if let Ok(t) = std::process::Command::new("curl")
+            .args(["-sL", "--max-time", "60", url]).output()
+        {
+            if t.status.success() && !t.stdout.is_empty() {
+                return Some(strip_gutenberg_boilerplate(&String::from_utf8_lossy(&t.stdout)));
+            }
+        }
+    }
+    None
+}
+
+/// Loose title match: the part of `want` before any ':' appears in `got`.
+fn title_matches(want: &str, got: &str) -> bool {
+    let main = want.split(':').next().unwrap_or(want).trim().to_lowercase();
+    !main.is_empty() && got.to_lowercase().contains(&main)
+}
+
+/// Strip Project Gutenberg's header/footer boilerplate.
+fn strip_gutenberg_boilerplate(s: &str) -> String {
+    let mut body = s;
+    if let Some(p) = s.find("*** START OF") {
+        if let Some(nl) = s[p..].find('\n') { body = &s[p + nl + 1..]; }
+    }
+    if let Some(p) = body.find("*** END OF") { body = &body[..p]; }
+    body.trim().to_string()
 }
 
 /// True if `b` matches the lowercased search `q` (empty = matches all).

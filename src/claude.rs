@@ -217,6 +217,38 @@ fn strip_code_fences(s: &str) -> String {
     s.to_string()
 }
 
+const DEFINE_MODEL: &str = "claude-haiku-4-5-20251001";
+
+/// Context-aware definition of a highlighted word/phrase (scribe pattern).
+pub fn define(phrase: &str, context: &str) -> Result<String, String> {
+    let ctx: String = context.chars().take(2000).collect();
+    let prompt = format!(
+        "Define \"{phrase}\" as it is used in the passage below \u{2014} the \
+         meaning that fits THIS context. 2-4 plain sentences, no preamble. If \
+         it is a term of art, name the field and what it means specifically here.\
+         \n\nPassage:\n{ctx}",
+        phrase = phrase, ctx = ctx
+    );
+    run_claude(&prompt, DEFINE_MODEL)
+}
+
+/// A reader's companion for an in-copyright real book we won't reproduce:
+/// a substantial synopsis + key ideas + where to read it legally.
+pub fn reader_companion(title: &str, author: &str, year: &str) -> Result<String, String> {
+    let by = if author.is_empty() { String::new() } else { format!(" by {}", author) };
+    let yr = if year.is_empty() { String::new() } else { format!(" ({})", year) };
+    let prompt = format!(
+        "Write a rich reader's companion (Markdown) for the real, in-copyright \
+         book \"{title}\"{by}{yr}. Do NOT reproduce the book's text. Include: a \
+         '# {title}' heading, a vivid synopsis, its central ideas and arguments \
+         chapter by chapter where you can, why it matters, and a final '## Where \
+         to read it' section pointing to buying or borrowing it (bookshop, \
+         publisher, or a library). ~1500-2500 words. Markdown only, no fences.",
+        title = title, by = by, yr = yr
+    );
+    Ok(strip_code_fences(&run_claude(&prompt, BOOK_MODEL)?))
+}
+
 /// Generate `n` more books focused on a topic/request, in the spirit of
 /// the existing library, avoiding existing titles.
 pub fn more_like(topic: &str, interests: &str, existing: &[String], n: usize) -> Result<Vec<Book>, String> {
