@@ -359,27 +359,41 @@ impl App {
     /// generation. `seed` true → broaden the whole library (generate_catalog
     /// against the interests); false → focus on the given topic.
     fn request_more(&mut self, seed: bool) {
-        let prompt = if seed { "Seed the library with (your interests): " } else { "More books on: " };
-        let topic = self.foot.ask(prompt, "");
-        let topic = topic.trim().to_string();
-        if topic.is_empty() { self.render_foot(""); return; }
+        let prompt = if seed {
+            "Add interests (blank = more of the same): "
+        } else {
+            "More books on: "
+        };
+        let input = self.foot.ask(prompt, "").trim().to_string();
 
-        // Remember a seed so later batches share the library's voice.
-        if seed {
-            if self.cat.interests.trim().is_empty() {
-                self.cat.interests = topic.clone();
-            } else if !self.cat.interests.contains(&topic) {
-                self.cat.interests = format!("{}\n{}", self.cat.interests, topic);
+        // Resolve the interests to generate from + an optional topic focus.
+        let (interests, topic): (String, Option<String>) = if seed {
+            if !input.is_empty() {
+                // Append to the saved interests so later batches share voice.
+                if self.cat.interests.trim().is_empty() {
+                    self.cat.interests = input.clone();
+                } else if !self.cat.interests.contains(&input) {
+                    self.cat.interests = format!("{}\n{}", self.cat.interests, input);
+                }
+                let _ = self.cat.save();
+                (self.cat.interests.clone(), None)
+            } else if !self.cat.interests.trim().is_empty() {
+                // Blank seed with interests already set = "more like these".
+                (self.cat.interests.clone(), None)
+            } else {
+                self.render_foot(" No interests yet \u{2014} type some, or press i to edit.");
+                return;
             }
-            let _ = self.cat.save();
-        }
+        } else {
+            if input.is_empty() { self.render_foot(""); return; }
+            let base = if self.cat.interests.trim().is_empty() { input.clone() } else { self.cat.interests.clone() };
+            (base, Some(input))
+        };
 
-        let interests = if self.cat.interests.trim().is_empty() { topic.clone() } else { self.cat.interests.clone() };
         let existing: Vec<String> = self.cat.books.iter().map(|b| b.title.clone()).collect();
         let slot = self.gen.clone();
-        let want_topic = if seed { None } else { Some(topic) };
         std::thread::spawn(move || {
-            let res = match want_topic {
+            let res = match topic {
                 Some(t) => claude::more_like(&t, &interests, &existing, GEN_N),
                 None => claude::generate_catalog(&interests, &existing, GEN_N),
             };
