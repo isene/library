@@ -8,7 +8,7 @@ use std::process::{Command, Stdio};
 
 use serde::Deserialize;
 
-use crate::store::Book;
+use crate::store::{Book, BookKind};
 
 /// Run `claude -p` with `prompt` on stdin, return its stdout text.
 /// `model` is optional (`""` = the CLI default).
@@ -48,6 +48,12 @@ struct GenBook {
     hook: String,
     #[serde(default)]
     tags: Vec<String>,
+    #[serde(default)]
+    kind: String,
+    #[serde(default)]
+    year: String,
+    #[serde(default)]
+    isbn: String,
 }
 
 /// Pull the first JSON array out of a model response, tolerating
@@ -63,14 +69,20 @@ fn parse_books(raw: &str) -> Result<Vec<Book>, String> {
         .ok_or_else(|| format!("no JSON array in response: {}", raw.chars().take(120).collect::<String>()))?;
     let gen: Vec<GenBook> = serde_json::from_str(json)
         .map_err(|e| format!("parse books: {}", e))?;
-    Ok(gen.into_iter().map(|g| Book {
-        title: g.title.trim().to_string(),
-        author: g.author.trim().to_string(),
-        category: if g.category.trim().is_empty() { "Miscellany".into() } else { g.category.trim().to_string() },
-        subcategory: g.subcategory.trim().to_string(),
-        hook: g.hook.trim().to_string(),
-        tags: g.tags,
-        ..Default::default()
+    Ok(gen.into_iter().map(|g| {
+        let kind = if g.kind.trim().eq_ignore_ascii_case("real") { BookKind::Real } else { BookKind::Conjured };
+        Book {
+            title: g.title.trim().to_string(),
+            author: g.author.trim().to_string(),
+            category: if g.category.trim().is_empty() { "Miscellany".into() } else { g.category.trim().to_string() },
+            subcategory: g.subcategory.trim().to_string(),
+            hook: g.hook.trim().to_string(),
+            tags: g.tags,
+            kind,
+            year: g.year.trim().to_string(),
+            isbn: g.isbn.trim().to_string(),
+            ..Default::default()
+        }
     }).collect())
 }
 
@@ -96,14 +108,20 @@ Propose {n} NEW books to add to the shelves. Deliberately vary the scope:\n\
 - some that illuminate just one small, surprising corner of a subject\n\
 Favour the genuinely interesting and non-obvious over generic textbooks. \
 Make each enticing — a book the owner would grab with both hands and start \
-reading.{avoid}\n\n\
+reading.\n\n\
+MIX IN REAL BOOKS: make roughly one in four a REAL, actually-published book \
+that genuinely fits the interests (kind \"real\") — use its true title, real \
+author, and publication year. The rest are invented books that should exist \
+(kind \"conjured\") with a fitting author persona. Both kinds get a hook.{avoid}\n\n\
 Respond with ONLY a JSON array (no markdown fences, no prose before or \
 after). Each element:\n\
-{{\"title\": \"...\", \"author\": \"a fitting author persona (a real-sounding \
-expert name)\", \"category\": \"top-level shelf, e.g. Physics, Philosophy, \
-History, Mathematics, Technology\", \"subcategory\": \"finer section (may be \
-empty)\", \"hook\": \"1-2 sentences on what makes it worth reading\", \
-\"tags\": [\"a\", \"few\", \"keywords\"]}}",
+{{\"title\": \"...\", \"author\": \"real author for real books, a fitting \
+persona for conjured ones\", \"kind\": \"real\" or \"conjured\", \"year\": \
+\"publication year for real books, else empty\", \"isbn\": \"ISBN if known \
+for real books, else empty\", \"category\": \"top-level shelf, e.g. Physics, \
+Philosophy, History, Mathematics, Technology\", \"subcategory\": \"finer \
+section (may be empty)\", \"hook\": \"1-2 sentences on what makes it worth \
+reading\", \"tags\": [\"a\", \"few\", \"keywords\"]}}",
         interests = interests, n = n, avoid = avoid
     );
     parse_books(&run_claude(&prompt, CATALOG_MODEL)?)

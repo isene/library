@@ -11,8 +11,19 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+/// Whether a book is conjured by Claude on demand, or a real existing
+/// book recommended into the library (fetched from a source on grab).
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum BookKind {
+    #[default]
+    Conjured,
+    Real,
+}
+
 /// One book on the shelf. While `written` is false only the metadata
-/// exists; grabbing it fills `books/<id>/book.md`.
+/// exists; grabbing it fills `books/<id>/book.md` (conjured → Claude
+/// writes it; real → fetched from the configured source).
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 pub struct Book {
     pub id: String,
@@ -25,6 +36,14 @@ pub struct Book {
     pub hook: String,
     #[serde(default)]
     pub tags: Vec<String>,
+    #[serde(default)]
+    pub kind: BookKind,
+    /// Real books only: publication year + ISBN (model-provided, may
+    /// want verifying at fetch time). Empty for conjured books.
+    #[serde(default)]
+    pub year: String,
+    #[serde(default)]
+    pub isbn: String,
     #[serde(default)]
     pub starred: bool,
     #[serde(default)]

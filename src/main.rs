@@ -13,8 +13,9 @@
 
 mod claude;
 mod store;
+mod tui;
 
-use store::{Book, Catalog};
+use store::{Book, BookKind, Catalog};
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -37,16 +38,7 @@ fn main() {
         Some("seed") => cmd_seed(&text, n),
         Some("more") => cmd_more(&text, n),
         Some("list") => print_shelf(&Catalog::load()),
-        _ => {
-            // TUI not built yet — show the shelf and point at the CLI.
-            let cat = Catalog::load();
-            if cat.books.is_empty() {
-                println!("Your library is empty. Stock it:\n  library --seed \"the things you're curious about\"");
-            } else {
-                print_shelf(&cat);
-                println!("\n(interactive browse/read TUI is the next build step)");
-            }
-        }
+        _ => tui::run(),
     }
 }
 
@@ -113,11 +105,13 @@ fn print_shelf(cat: &Catalog) {
 
 fn print_book(b: &Book) {
     let star = if b.starred { "★ " } else { "  " };
+    let kind = if b.kind == BookKind::Real { "◆ " } else { "" };
     let got = if b.written { " ✓read" } else { "" };
     let sub = if b.subcategory.is_empty() { String::new() } else { format!(" [{}]", b.subcategory) };
-    println!("{star}{title}{sub}{got}", star = star, title = b.title, sub = sub, got = got);
+    println!("{star}{kind}{title}{sub}{got}", star = star, kind = kind, title = b.title, sub = sub, got = got);
     if !b.author.is_empty() {
-        println!("    by {}", b.author);
+        let yr = if b.kind == BookKind::Real && !b.year.is_empty() { format!(" ({})", b.year) } else { String::new() };
+        println!("    by {}{}", b.author, yr);
     }
     if !b.hook.is_empty() {
         println!("    {}", b.hook);
