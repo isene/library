@@ -790,7 +790,7 @@ impl App {
                 "W" => self.cycle_width(false),
                 "C-B" => self.cycle_border(),
                 "/" => self.do_search(),
-                "ENTER" => self.grab(),
+                "ENTER" | "RIGHT" => self.grab(),
                 "r" => {
                     self.cat = Catalog::load();
                     self.rebuild(None);
