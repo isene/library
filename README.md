@@ -4,7 +4,7 @@
 
 **A personal library of the books that *should* exist — and a way to read them.**
 
-![Version](https://img.shields.io/badge/version-0.1.1-blue) ![Rust](https://img.shields.io/badge/language-Rust-f74c00) ![License](https://img.shields.io/badge/license-Unlicense-green) ![Platform](https://img.shields.io/badge/platform-Linux-blue) ![Stay Amazing](https://img.shields.io/badge/Stay-Amazing-important)
+![Version](https://img.shields.io/badge/version-0.2.0-blue) ![Rust](https://img.shields.io/badge/language-Rust-f74c00) ![License](https://img.shields.io/badge/license-Unlicense-green) ![Platform](https://img.shields.io/badge/platform-Linux-blue) ![Stay Amazing](https://img.shields.io/badge/Stay-Amazing-important)
 
 Curate a shelf of books that ought to exist but mostly don't. Browse the
 catalogue, star the ones you want, and when you grab a book Claude sits down
@@ -114,6 +114,7 @@ library --list       # print the catalogue
 | `d` / `<` | mark for removal / purge marked |
 | `w` / `W` | narrow / widen the list pane |
 | `^B` | cycle pane borders |
+| `P` | colour configuration popup (shelf + reader palette) |
 | `r` | reload from disk |
 | `q` | quit |
 
@@ -123,8 +124,12 @@ library --list       # print the catalogue
 |---|---|
 | `↑`/`↓` `Space` | scroll |
 | `w` / `W` | narrow / widen the text |
+| `m` | set / move your bookmark here (resumes there next open; syncs to the phone) |
+| `e` | export the book (with figures) to a PDF beside the source |
+| `c` | discuss the text in a Claude session (full book, or current chapter for a deep dive) |
 | `d` | define the highlighted word/phrase in context |
 | `+` | extend a quick read into a full book |
+| `P` | colour configuration popup |
 | `q` / `Esc` | back to the shelves |
 
 ## Where it lives
