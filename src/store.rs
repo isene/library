@@ -55,6 +55,42 @@ pub struct Book {
     pub created_at: i64,
 }
 
+/// User-tunable 256-colour palette for the TUI. Struct-level `#[serde(default)]`
+/// fills any missing field from `Default`, so old catalogs and partial edits
+/// stay valid. Two groups: the shelf (library) view and the reader view.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug)]
+#[serde(default)]
+pub struct Colors {
+    pub header: u8,        // category heading
+    pub body: u8,          // book title
+    pub dim: u8,           // author / hints
+    pub sel: u8,           // selection arrow / underline
+    pub del: u8,           // marked for deletion
+    pub real: u8,          // real (existing) book
+    pub body_bright: u8,   // written conjured book
+    pub real_bright: u8,   // written real book
+    pub hook: u8,          // hook / detail body
+    pub tag: u8,           // tags / figure captions
+    pub border: u8,        // pane borders
+    pub bar_bg: u8,        // top + status bar background
+    pub reader_fg: u8,     // reader body text
+    pub reader_h1: u8,     // reader title (#)
+    pub reader_h2: u8,     // reader chapter (##)
+    pub reader_h3: u8,     // reader subhead (###)
+    pub reader_quote: u8,  // reader pull-quote
+}
+
+impl Default for Colors {
+    fn default() -> Self {
+        Colors {
+            header: 73, body: 252, dim: 245, sel: 81, del: 88,
+            real: 222, body_bright: 255, real_bright: 229, hook: 250,
+            tag: 109, border: 238, bar_bg: 236,
+            reader_fg: 255, reader_h1: 81, reader_h2: 73, reader_h3: 109, reader_quote: 245,
+        }
+    }
+}
+
 /// The full catalog: the interview/seed summary plus every book idea.
 #[derive(Serialize, Deserialize, Default)]
 pub struct Catalog {
@@ -76,6 +112,9 @@ pub struct Catalog {
     /// (Project Gutenberg full text, else a Claude reader's companion).
     #[serde(default)]
     pub fetch_cmd: String,
+    /// User-tuned colour overrides (the `P` config popup).
+    #[serde(default)]
+    pub colors: Colors,
 }
 
 pub fn home() -> PathBuf {
