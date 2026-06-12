@@ -11,7 +11,9 @@
 //!   library --list                          print the current shelf
 //!   library                                 (TUI — coming next)
 
+mod bookmark;
 mod claude;
+mod export;
 mod store;
 mod tui;
 
@@ -28,6 +30,7 @@ fn main() {
             "--seed" if i + 1 < args.len() => { mode = Some("seed"); text = args[i + 1].clone(); i += 2; }
             "--more" if i + 1 < args.len() => { mode = Some("more"); text = args[i + 1].clone(); i += 2; }
             "--list" => { mode = Some("list"); i += 1; }
+            "--pdf" if i + 1 < args.len() => { mode = Some("pdf"); text = args[i + 1].clone(); i += 2; }
             "--n" if i + 1 < args.len() => { n = args[i + 1].parse().unwrap_or(n); i += 2; }
             "-h" | "--help" => { print_help(); return; }
             _ => { i += 1; }
@@ -38,6 +41,7 @@ fn main() {
         Some("seed") => cmd_seed(&text, n),
         Some("more") => cmd_more(&text, n),
         Some("list") => print_shelf(&Catalog::load()),
+        Some("pdf") => cmd_pdf(&text),
         _ => tui::run(),
     }
 }
@@ -85,6 +89,24 @@ fn generate_into(cat: &mut Catalog, topic: Option<&str>, interests: &str, n: usi
             print_shelf(cat);
         }
         Err(e) => eprintln!("generation failed: {}", e),
+    }
+}
+
+/// Headless PDF export: `library --pdf <book-id>` (also the reader's `e`).
+fn cmd_pdf(id: &str) {
+    let cat = Catalog::load();
+    let Some(book) = cat.books.iter().find(|b| b.id == id || store::slugify(&b.title) == store::slugify(id)) else {
+        eprintln!("no book with id/title '{}'", id);
+        std::process::exit(1);
+    };
+    let md = std::fs::read_to_string(store::book_md(&book.id)).unwrap_or_default();
+    if md.trim().is_empty() {
+        eprintln!("'{}' has not been written yet", book.title);
+        std::process::exit(1);
+    }
+    match export::export_book_pdf(&book.id, &book.title, &md) {
+        Ok(p) => println!("exported → {}", p.display()),
+        Err(e) => { eprintln!("pdf export failed: {}", e); std::process::exit(1); }
     }
 }
 

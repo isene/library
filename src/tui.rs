@@ -10,6 +10,7 @@ use std::sync::mpsc::{self, Receiver, Sender};
 
 use crust::{Crust, Input, Pane, style};
 
+use crate::bookmark;
 use crate::claude;
 use crate::store::{self, Book, BookKind, Catalog};
 
@@ -24,6 +25,7 @@ const C_REAL_BRIGHT: u8 = 229;  // written real book — light gold + bold
 const C_HOOK:   u8 = 250;  // hook body
 const C_TAG:    u8 = 109;  // tags
 const C_BORDER: u8 = 238;  // pane borders
+const C_READER: u8 = 255;  // reader body text (white)
 
 const LIST_W: u16 = 46;
 const GEN_N: usize = 10;   // books per `+`/`s` batch
@@ -646,7 +648,12 @@ impl App {
         let max_w = cols.saturating_sub(4).max(20);
         let mut wrap_w = if self.cat.read_w >= 40 { (self.cat.read_w as usize).min(max_w) } else { max_w.min(86) };
         let (mut lines, mut figs) = render_markdown(&md, wrap_w, &img_dir, images_ok);
-        let mut top = 0usize;
+        // Resume at the synced bookmark (a fraction of the way through).
+        let mut top = {
+            let mt = lines.len().saturating_sub(h);
+            (bookmark::load(id).unwrap_or(0.0) * mt as f32).round() as usize
+        };
+        let mut note: Option<String> = None;
         let mut shown: Vec<(u16, u16, u16, u16)> = Vec::new();
 
         let mut body = Pane::new(2, 2, self.cols.saturating_sub(2), self.rows.saturating_sub(2), C_BODY as u16, 0);
@@ -674,7 +681,10 @@ impl App {
             body.full_refresh();
 
             let ext_hint = if is_deep { "" } else { " \u{00b7} + deepen" };
-            self.foot.say(&style::fg(&format!(" j/k \u{00b7} SPACE/b \u{00b7} g/G \u{00b7} w/W width \u{00b7} d define{} \u{00b7} q back", ext_hint), C_DIM));
+            match &note {
+                Some(m) => self.foot.say(&style::fg(&format!(" {}", m), C_HEADER)),
+                None => self.foot.say(&style::fg(&format!(" j/k \u{00b7} SPACE/b \u{00b7} g/G \u{00b7} w/W width \u{00b7} m mark \u{00b7} e pdf \u{00b7} c discuss \u{00b7} d define{} \u{00b7} q back", ext_hint), C_DIM)),
+            }
 
             // Show figures fully inside the current view.
             if images_ok {
@@ -692,6 +702,7 @@ impl App {
             }
 
             let Some(key) = Input::getchr(None) else { continue };
+            note = None; // a status note shows until the next key
             match key.as_str() {
                 "q" | "ESC" | "h" | "LEFT" => break,
                 "j" | "DOWN" => if top < max_top { top += 1; },
@@ -737,6 +748,29 @@ impl App {
                         }
                     }
                 }
+                "m" => {
+                    let frac = if max_top == 0 { 0.0 } else { top as f32 / max_top as f32 };
+                    bookmark::save(id, frac);
+                    note = Some(format!("\u{1f516} Bookmark set at {}%", (frac * 100.0).round() as i32));
+                }
+                "e" => {
+                    for (x, y, w, hh) in shown.drain(..) { display.clear(x, y, w, hh, term_w, term_h); }
+                    self.foot.say(&style::fg(" exporting PDF\u{2026}", C_DIM));
+                    match crate::export::export_book_pdf(id, &title, &md) {
+                        Ok(p) => note = Some(format!("Saved PDF \u{2192} {}", p.display())),
+                        Err(e) => note = Some(format!("PDF failed: {}", e)),
+                    }
+                }
+                "c" => {
+                    let frac = if max_top == 0 { 0.0 } else { top as f32 / max_top as f32 };
+                    let context = if is_deep { current_chapter(&md, frac) } else { md.clone() };
+                    for (x, y, w, hh) in shown.drain(..) { display.clear(x, y, w, hh, term_w, term_h); }
+                    self.discuss(&title, &context, is_deep);
+                    Crust::clear_screen();
+                    self.top.invalidate();
+                    self.foot.invalidate();
+                    note = Some("back from discussion".into());
+                }
                 "+" if !is_deep => { extend = true; break; }
                 _ => {}
             }
@@ -758,6 +792,33 @@ impl App {
             }
         }
         self.render_all();
+    }
+
+    /// Discuss the text in a break-out Claude session (mirrors scribe's
+    /// `:chat`). The book (quick read) or current chapter (deep dive) is
+    /// dropped to a tempfile and referenced in the opening prompt; `/exit`
+    /// in claude returns to the reader.
+    fn discuss(&mut self, title: &str, context: &str, is_deep: bool) {
+        use std::io::Write as _;
+        let tmpfile = format!("/tmp/library-discuss-{}.md", std::process::id());
+        let _ = std::fs::write(&tmpfile, context);
+        let scope = if is_deep { "the current chapter" } else { "the full book" };
+        let initial = format!(
+            "I'm reading a book titled \"{}\" in my library app and want to discuss it. \
+             The text of {} is in {} \u{2014} read it, then let's talk: ideas, questions, \
+             pushback, connections to other things. When I'm done, /exit returns me to \
+             the reader.",
+            title, scope, tmpfile);
+        print!("\x1b[?2004l");
+        let _ = std::io::stdout().flush();
+        Crust::cleanup();
+        Crust::clear_screen();
+        let _ = std::process::Command::new("claude").arg(&initial).status();
+        Crust::init();
+        Crust::set_app_identity("Library");
+        print!("\x1b[?2004h");
+        let _ = std::io::stdout().flush();
+        let _ = std::fs::remove_file(&tmpfile);
     }
 
     fn run(&mut self) {
@@ -813,6 +874,30 @@ const FIG_ROWS: usize = 18;
 /// inline figures. Headings are coloured/bold; `>` lines are dimmed
 /// pull-quotes; `[[FIG n: caption]]` reserves space + records the figure;
 /// body paragraphs wrap to `width` with inline **bold** / *italic*.
+/// The chapter (a `## ` section) the reader is currently in, picked by
+/// reading fraction across the source. Used to scope a deep-dive discussion.
+fn current_chapter(md: &str, frac: f32) -> String {
+    let mut chapters: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    for line in md.lines() {
+        if line.starts_with("## ") && !cur.trim().is_empty() {
+            chapters.push(std::mem::take(&mut cur));
+        }
+        cur.push_str(line);
+        cur.push('\n');
+    }
+    if !cur.trim().is_empty() { chapters.push(cur); }
+    if chapters.is_empty() { return md.to_string(); }
+    let total: usize = chapters.iter().map(|c| c.len()).sum();
+    let target = (frac.clamp(0.0, 1.0) as f64 * total as f64) as usize;
+    let mut acc = 0;
+    for c in &chapters {
+        acc += c.len();
+        if target <= acc { return c.clone(); }
+    }
+    chapters.last().cloned().unwrap_or_else(|| md.to_string())
+}
+
 fn render_markdown(md: &str, width: usize, img_dir: &std::path::Path, images_ok: bool)
     -> (Vec<String>, Vec<FigPos>)
 {
@@ -862,7 +947,7 @@ fn render_markdown(md: &str, width: usize, img_dir: &std::path::Path, images_ok:
             out.push(String::new());
         } else {
             for wl in wrap(line, width).lines() {
-                out.push(style::fg(&style_inline(wl), C_HOOK));
+                out.push(style::fg(&style_inline(wl), C_READER));
             }
         }
     }
