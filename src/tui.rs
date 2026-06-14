@@ -13,6 +13,7 @@ use crust::{Crust, Input, Pane, style};
 
 use crate::bookmark;
 use crate::claude;
+use crate::import;
 use crate::store::{self, Book, BookKind, Catalog, Colors};
 
 // The palette is a process-global, seeded from the catalog at startup and
@@ -87,6 +88,7 @@ pub fn run() {
     Crust::set_app_identity("Library");
     let mut app = App::new();
     app.render_all();
+    app.drain_inbox_startup();
     app.run();
     let _ = app.cat.save();
     Crust::cleanup();
@@ -213,6 +215,70 @@ impl App {
         let _ = std::fs::remove_file(&tmp);
         self.render_all();
         self.render_foot(" Interests saved. Press s / + to grow the shelf to match.");
+    }
+
+    /// `a` — import a PDF from the laptop. Prompts for the file, a title,
+    /// a subject (shelf), and an optional author, then runs the same
+    /// pdftotext → Claude-structure → live-book pipeline the phone inbox
+    /// uses. Blocking by design: a deliberate one-off action whose result
+    /// the user is waiting on.
+    fn import_book(&mut self) {
+        let raw_path = self.foot.ask("Import PDF \u{2014} path: ", "");
+        if self.foot.last_escaped || raw_path.trim().is_empty() { self.render_foot(""); return; }
+        let pdf = import::expand_tilde(raw_path.trim());
+        if !pdf.exists() {
+            self.render_foot(&format!(" No such file: {}", pdf.display()));
+            return;
+        }
+        let default_title = pdf.file_stem().and_then(|s| s.to_str())
+            .unwrap_or("").replace(['_', '-'], " ");
+        let title = self.foot.ask("Title: ", default_title.trim());
+        if self.foot.last_escaped { self.render_foot(""); return; }
+        // Offer the existing shelves as the subject default so imports land
+        // alongside related books rather than scattering new headings.
+        let cats = self.cat.categories();
+        let default_subject = cats.first().map(|s| s.as_str()).unwrap_or("Imported");
+        if !cats.is_empty() {
+            self.render_foot(&format!(" Shelves: {}", cats.join(" \u{00b7} ")));
+        }
+        let subject = self.foot.ask("Subject: ", default_subject);
+        if self.foot.last_escaped { self.render_foot(""); return; }
+        let author = self.foot.ask("Author (optional): ", "");
+        if self.foot.last_escaped { self.render_foot(""); return; }
+
+        self.render_foot(&format!(
+            " Importing \u{201c}{}\u{201d} \u{2014} structuring with Claude, please wait\u{2026}",
+            trunc(title.trim(), 40)));
+        let _ = std::io::Write::flush(&mut std::io::stdout());
+        match import::import_pdf(&mut self.cat, &pdf, title.trim(), subject.trim(), author.trim()) {
+            Ok(t) => {
+                self.rebuild(Some(store::slugify(&t)));
+                self.render_all();
+                self.render_foot(&format!(" Imported \u{201c}{}\u{201d} \u{2014} press \u{21b5} to read.", trunc(&t, 48)));
+            }
+            Err(e) => self.render_foot(&format!(" Import failed: {}", e)),
+        }
+    }
+
+    /// On launch, import any PDFs the phone queued in `~/.library/inbox/`.
+    /// Stat-gated: zero work (and no Claude calls) when the inbox is empty,
+    /// which is the normal case. Blocks briefly while structuring queued
+    /// PDFs — only happens right after open, and only when something's there.
+    fn drain_inbox_startup(&mut self) {
+        let n = import::inbox_count();
+        if n == 0 { return; }
+        self.render_foot(&format!(
+            " Importing {} PDF(s) added on your phone \u{2014} structuring with Claude\u{2026}", n));
+        let _ = std::io::Write::flush(&mut std::io::stdout());
+        let (done, errs) = import::drain_inbox(&mut self.cat);
+        self.rebuild(None);
+        self.render_all();
+        let msg = if errs.is_empty() {
+            format!(" Imported {} book(s) from your phone.", done.len())
+        } else {
+            format!(" Imported {}; {} failed: {}", done.len(), errs.len(), errs.join("; "))
+        };
+        self.render_foot(&msg);
     }
 
     /// Rebuild the display list from the catalog (category heading then
@@ -927,6 +993,7 @@ impl App {
                 "+" => self.request_more(false),
                 "s" => self.request_more(true),
                 "i" => self.edit_interests(),
+                "a" => self.import_book(),
                 "w" => self.cycle_width(true),
                 "W" => self.cycle_width(false),
                 "C-B" => self.cycle_border(),

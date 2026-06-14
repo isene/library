@@ -1,6 +1,6 @@
 [package]
 name = "library"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 authors = ["Geir Isene <g@isene.com>"]
 description = "Generative personal library TUI — curate a shelf of books that should exist, then have them written on demand."

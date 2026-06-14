@@ -14,6 +14,7 @@
 mod bookmark;
 mod claude;
 mod export;
+mod import;
 mod store;
 mod tui;
 
@@ -31,6 +32,7 @@ fn main() {
             "--more" if i + 1 < args.len() => { mode = Some("more"); text = args[i + 1].clone(); i += 2; }
             "--list" => { mode = Some("list"); i += 1; }
             "--pdf" if i + 1 < args.len() => { mode = Some("pdf"); text = args[i + 1].clone(); i += 2; }
+            "--import" => { mode = Some("import"); i += 1; }
             "--n" if i + 1 < args.len() => { n = args[i + 1].parse().unwrap_or(n); i += 2; }
             "-h" | "--help" => { print_help(); return; }
             _ => { i += 1; }
@@ -42,6 +44,7 @@ fn main() {
         Some("more") => cmd_more(&text, n),
         Some("list") => print_shelf(&Catalog::load()),
         Some("pdf") => cmd_pdf(&text),
+        Some("import") => cmd_import(),
         _ => tui::run(),
     }
 }
@@ -110,6 +113,25 @@ fn cmd_pdf(id: &str) {
     }
 }
 
+/// Headless inbox drain: import every PDF added on the phone (or dropped
+/// into `~/.library/inbox/`). Run from cron or by hand; the TUI also drains
+/// the inbox on launch.
+fn cmd_import() {
+    let mut cat = Catalog::load();
+    let n = import::inbox_count();
+    if n == 0 {
+        eprintln!("inbox empty — drop a PDF in {} (with an optional <name>.json sidecar)",
+            import::inbox_dir().display());
+        return;
+    }
+    eprintln!("importing {} PDF(s) — structuring with Claude…", n);
+    let (done, errs) = import::drain_inbox(&mut cat);
+    for t in &done { eprintln!("  ✓ {}", t); }
+    for e in &errs { eprintln!("  ✗ {}", e); }
+    eprintln!("done: {} imported, {} failed. shelf now holds {}.",
+        done.len(), errs.len(), cat.books.len());
+}
+
 /// Print the shelf grouped by category — the read-only stand-in until
 /// the TUI exists.
 fn print_shelf(cat: &Catalog) {
@@ -146,7 +168,8 @@ fn print_help() {
          library --seed \"<interests>\" [--n N]   stock the shelves from an interest blurb\n\
          library --more \"<topic>\"     [--n N]   add more books on a topic\n\
          library --list                          print the current shelf\n\
-         library                                 browse (TUI — coming next)\n\n\
+         library --import                        import PDFs queued in ~/.library/inbox/\n\
+         library                                 browse (TUI; press 'a' to add a PDF)\n\n\
          Data lives in ~/.library/ (catalog.json + books/<id>/)."
     );
 }

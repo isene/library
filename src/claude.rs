@@ -217,6 +217,76 @@ fn strip_code_fences(s: &str) -> String {
     s.to_string()
 }
 
+const IMPORT_MODEL: &str = "claude-sonnet-4-6";
+
+/// Re-render raw `pdftotext` output into clean, readable Markdown for an
+/// imported book. Long inputs are processed in paragraph-aligned chunks:
+/// a model response is output-capped, so a whole long book can't come back
+/// in one shot. The first chunk carries the `# {title}` heading; later
+/// chunks continue without re-adding it. Content is preserved verbatim in
+/// meaning — never summarised, never invented.
+pub fn structure_pdf(title: &str, author: &str, raw: &str) -> Result<String, String> {
+    let chunks = chunk_text(raw, 8000);
+    let total = chunks.len();
+    let mut out = String::new();
+    for (i, chunk) in chunks.iter().enumerate() {
+        let md = structure_chunk(title, author, chunk, i == 0, i + 1, total)?;
+        let md = md.trim();
+        if md.is_empty() { continue; }
+        if !out.is_empty() { out.push_str("\n\n"); }
+        out.push_str(md);
+    }
+    if out.trim().is_empty() {
+        return Err("structuring produced no text".into());
+    }
+    Ok(out)
+}
+
+fn structure_chunk(title: &str, author: &str, chunk: &str, first: bool, n: usize, total: usize)
+    -> Result<String, String>
+{
+    let by = if author.trim().is_empty() { String::new() } else { format!(" by {}", author.trim()) };
+    let head = if first {
+        format!("Start with a single top-level '# {}' heading.", title)
+    } else {
+        "Do NOT add a top-level '# ' heading — this is a continuation; pick up where the text left off.".to_string()
+    };
+    let part = if total > 1 { format!(" (part {} of {})", n, total) } else { String::new() };
+    let prompt = format!(
+        "The text below is raw `pdftotext` output for the book \"{title}\"{by}{part}. \
+         It has hard-wrapped lines, words split by end-of-line hyphens, page numbers, \
+         and running headers/footers. Re-render it as clean, readable Markdown:\n\
+         - Rejoin hard-wrapped lines into flowing paragraphs; repair hyphen-split words.\n\
+         - Drop page numbers, running headers/footers, and other layout cruft.\n\
+         - Add '## ' headings only where a real chapter or section heading actually \
+           occurs in the text.\n\
+         - {head}\n\
+         Preserve ALL the prose and its meaning. Do NOT summarise, omit, paraphrase, \
+         or invent text — keep the original wording. Output ONLY the Markdown: no \
+         preamble, no commentary, no code fences.\n\n\
+         RAW TEXT:\n{chunk}",
+        title = title, by = by, part = part, head = head, chunk = chunk
+    );
+    Ok(strip_code_fences(&run_claude(&prompt, IMPORT_MODEL)?))
+}
+
+/// Split text into ~`target`-char chunks, breaking only at blank lines
+/// (paragraph boundaries) so a paragraph is never cut mid-sentence.
+fn chunk_text(raw: &str, target: usize) -> Vec<String> {
+    let mut chunks = Vec::new();
+    let mut cur = String::new();
+    for para in raw.split("\n\n") {
+        if !cur.is_empty() && cur.len() + para.len() > target {
+            chunks.push(std::mem::take(&mut cur));
+        }
+        if !cur.is_empty() { cur.push_str("\n\n"); }
+        cur.push_str(para);
+    }
+    if !cur.trim().is_empty() { chunks.push(cur); }
+    if chunks.is_empty() { chunks.push(raw.to_string()); }
+    chunks
+}
+
 const DEFINE_MODEL: &str = "claude-haiku-4-5-20251001";
 
 /// Context-aware definition of a highlighted word/phrase (scribe pattern).

@@ -187,7 +187,7 @@ impl Catalog {
         added
     }
 
-    fn unique_id(&self, title: &str) -> String {
+    pub(crate) fn unique_id(&self, title: &str) -> String {
         let base = {
             let s = slugify(title);
             if s.is_empty() { "book".to_string() } else { s }
