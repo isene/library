@@ -226,7 +226,7 @@ const IMPORT_MODEL: &str = "claude-sonnet-4-6";
 /// chunks continue without re-adding it. Content is preserved verbatim in
 /// meaning — never summarised, never invented.
 pub fn structure_pdf(title: &str, author: &str, raw: &str) -> Result<String, String> {
-    let chunks = chunk_text(raw, 8000);
+    let chunks = chunk_text(raw, 12000);
     let total = chunks.len();
     let mut out = String::new();
     for (i, chunk) in chunks.iter().enumerate() {
@@ -255,11 +255,19 @@ fn structure_chunk(title: &str, author: &str, chunk: &str, first: bool, n: usize
     let prompt = format!(
         "The text below is raw `pdftotext` output for the book \"{title}\"{by}{part}. \
          It has hard-wrapped lines, words split by end-of-line hyphens, page numbers, \
-         and running headers/footers. Re-render it as clean, readable Markdown:\n\
+         and running headers/footers. It also contains \u{27e6}PAGE n\u{27e7} markers \
+         showing where each PDF page begins. Re-render it as clean, readable Markdown:\n\
          - Rejoin hard-wrapped lines into flowing paragraphs; repair hyphen-split words.\n\
          - Drop page numbers, running headers/footers, and other layout cruft.\n\
          - Add '## ' headings only where a real chapter or section heading actually \
            occurs in the text.\n\
+         - FIGURES: wherever the book has a figure, diagram, illustration, chart, or \
+           table (a captioned float, or a clearly-drawn diagram the prose discusses), \
+           emit a line `[[FIGPAGE n: short caption]]` on its own line at that spot, \
+           where n is the number from the nearest preceding \u{27e6}PAGE n\u{27e7} \
+           marker. Be conservative: only mark figures clearly present, not every \
+           passing mention. Reuse the figure's own caption text where it has one.\n\
+         - Do NOT include the \u{27e6}PAGE n\u{27e7} markers themselves in your output.\n\
          - {head}\n\
          Preserve ALL the prose and its meaning. Do NOT summarise, omit, paraphrase, \
          or invent text — keep the original wording. Output ONLY the Markdown: no \

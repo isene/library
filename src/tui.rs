@@ -59,6 +59,10 @@ type GenResult = Result<Vec<Book>, String>;
 /// (book id, write result) returned when a grabbed book finishes writing.
 type WriteResult = (String, Result<(), String>);
 
+/// (reserved id, title, built book) returned when a background PDF import
+/// finishes. The book is added to the catalog on the main thread.
+type ImportResult = (String, String, Result<Book, String>);
+
 pub struct App {
     cols: u16,
     rows: u16,
@@ -81,6 +85,13 @@ pub struct App {
     write_tx: Sender<WriteResult>,
     write_rx: Receiver<WriteResult>,
     writing: HashSet<String>,
+    import_tx: Sender<ImportResult>,
+    import_rx: Receiver<ImportResult>,
+    /// In-flight PDF imports: (reserved id, title, inbox pdf to delete on
+    /// success). Drives the spinner and reserves ids so concurrent imports
+    /// don't collide. Inbox cleanup happens on the main thread after the
+    /// catalog entry is added, so a quit mid-import never loses the queue.
+    importing: Vec<(String, String, Option<std::path::PathBuf>)>,
 }
 
 pub fn run() {
@@ -88,7 +99,7 @@ pub fn run() {
     Crust::set_app_identity("Library");
     let mut app = App::new();
     app.render_all();
-    app.drain_inbox_startup();
+    app.start_inbox_imports();
     app.run();
     let _ = app.cat.save();
     Crust::cleanup();
@@ -116,6 +127,7 @@ impl App {
         foot.scroll = false; foot.wrap = false;
         let (gen_tx, gen_rx) = mpsc::channel();
         let (write_tx, write_rx) = mpsc::channel();
+        let (import_tx, import_rx) = mpsc::channel();
         let mut app = App {
             cols, rows, top, left, right, foot,
             cat,
@@ -131,6 +143,8 @@ impl App {
             search: String::new(),
             write_tx, write_rx,
             writing: HashSet::new(),
+            import_tx, import_rx,
+            importing: Vec::new(),
         };
         app.apply_border_state();
         app.rebuild(None);
@@ -218,10 +232,10 @@ impl App {
     }
 
     /// `a` — import a PDF from the laptop. Prompts for the file, a title,
-    /// a subject (shelf), and an optional author, then runs the same
-    /// pdftotext → Claude-structure → live-book pipeline the phone inbox
-    /// uses. Blocking by design: a deliberate one-off action whose result
-    /// the user is waiting on.
+    /// a subject (shelf), and an optional author, then runs the import on a
+    /// background thread (pdftotext → Claude-structure → figure pages →
+    /// live book). The UI stays interactive; the book lands via
+    /// `drain_imports` when ready, exactly like a grabbed conjured book.
     fn import_book(&mut self) {
         let raw_path = self.foot.ask("Import PDF \u{2014} path: ", "");
         if self.foot.last_escaped || raw_path.trim().is_empty() { self.render_foot(""); return; }
@@ -237,48 +251,113 @@ impl App {
         // Offer the existing shelves as the subject default so imports land
         // alongside related books rather than scattering new headings.
         let cats = self.cat.categories();
-        let default_subject = cats.first().map(|s| s.as_str()).unwrap_or("Imported");
+        let default_subject = cats.first().map(|s| s.as_str()).unwrap_or("Imported").to_string();
         if !cats.is_empty() {
             self.render_foot(&format!(" Shelves: {}", cats.join(" \u{00b7} ")));
         }
-        let subject = self.foot.ask("Subject: ", default_subject);
+        let subject = self.foot.ask("Subject: ", &default_subject);
         if self.foot.last_escaped { self.render_foot(""); return; }
         let author = self.foot.ask("Author (optional): ", "");
         if self.foot.last_escaped { self.render_foot(""); return; }
 
+        let disp = if title.trim().is_empty() { default_title } else { title.trim().to_string() };
+        self.start_import(pdf, title, subject, author, false);
+        self.render_top();
         self.render_foot(&format!(
-            " Importing \u{201c}{}\u{201d} \u{2014} structuring with Claude, please wait\u{2026}",
-            trunc(title.trim(), 40)));
-        let _ = std::io::Write::flush(&mut std::io::stdout());
-        match import::import_pdf(&mut self.cat, &pdf, title.trim(), subject.trim(), author.trim()) {
-            Ok(t) => {
-                self.rebuild(Some(store::slugify(&t)));
-                self.render_all();
-                self.render_foot(&format!(" Imported \u{201c}{}\u{201d} \u{2014} press \u{21b5} to read.", trunc(&t, 48)));
+            " Importing \u{201c}{}\u{201d} in the background \u{2014} keep browsing; it'll appear when ready.",
+            trunc(&disp, 36)));
+    }
+
+    /// On launch, kick off background imports for any PDFs the phone queued
+    /// in `~/.library/inbox/`. Stat-gated: zero work when the inbox is empty
+    /// (the normal case). Non-blocking — the shelf stays usable while big
+    /// books structure in the background.
+    fn start_inbox_imports(&mut self) {
+        let pdfs = import::inbox_pdfs();
+        if pdfs.is_empty() { return; }
+        let n = pdfs.len();
+        for pdf in pdfs {
+            let side = pdf.with_extension("json");
+            let (title, subject, author) = if side.exists() {
+                import::read_sidecar(&side)
+            } else {
+                (String::new(), String::new(), String::new())
+            };
+            self.start_import(pdf, title, subject, author, true);
+        }
+        self.render_top();
+        self.render_foot(&format!(
+            " Importing {} PDF(s) added on your phone \u{2014} each appears as it finishes.", n));
+    }
+
+    /// Spawn one background import. `cleanup_inbox` marks an inbox-sourced
+    /// PDF whose source + sidecar are removed (on the main thread) once the
+    /// catalog entry is added — so a quit mid-import never drops the queue.
+    fn start_import(&mut self, pdf: std::path::PathBuf, title: String, subject: String,
+                    author: String, cleanup_inbox: bool) {
+        let title = {
+            let t = title.trim();
+            if t.is_empty() { import::title_from_path(&pdf) } else { t.to_string() }
+        };
+        if self.cat.has_title(&title) {
+            self.render_foot(&format!(" \u{201c}{}\u{201d} is already on the shelf.", trunc(&title, 40)));
+            return;
+        }
+        let id = self.unique_import_id(&title);
+        let cleanup = if cleanup_inbox { Some(pdf.clone()) } else { None };
+        self.importing.push((id.clone(), title.clone(), cleanup));
+        let tx = self.import_tx.clone();
+        std::thread::spawn(move || {
+            let res = import::build_book(&pdf, &id, &title, &subject, &author);
+            let _ = tx.send((id, title, res));
+        });
+    }
+
+    /// Collect finished background imports (non-blocking): add the built
+    /// book to the catalog, save, clean up any inbox source, and toast.
+    fn drain_imports(&mut self) {
+        while let Ok((id, title, res)) = self.import_rx.try_recv() {
+            let cleanup = self.importing.iter()
+                .find(|(i, _, _)| i == &id)
+                .and_then(|(_, _, c)| c.clone());
+            self.importing.retain(|(i, _, _)| i != &id);
+            match res {
+                Ok(book) => {
+                    self.cat.books.push(book);
+                    let _ = self.cat.save();
+                    if let Some(pdf) = cleanup {
+                        let _ = std::fs::remove_file(&pdf);
+                        let _ = std::fs::remove_file(pdf.with_extension("json"));
+                    }
+                    self.rebuild(Some(id));
+                    self.render_all();
+                    self.render_foot(&format!(
+                        " \u{201c}{}\u{201d} imported \u{2014} press \u{21b5} to read.", trunc(&title, 44)));
+                }
+                Err(e) => {
+                    // Leave any inbox source in place so the next launch retries.
+                    self.render_all();
+                    self.render_foot(&format!(" Import failed ({}): {}", trunc(&title, 28), e));
+                }
             }
-            Err(e) => self.render_foot(&format!(" Import failed: {}", e)),
         }
     }
 
-    /// On launch, import any PDFs the phone queued in `~/.library/inbox/`.
-    /// Stat-gated: zero work (and no Claude calls) when the inbox is empty,
-    /// which is the normal case. Blocks briefly while structuring queued
-    /// PDFs — only happens right after open, and only when something's there.
-    fn drain_inbox_startup(&mut self) {
-        let n = import::inbox_count();
-        if n == 0 { return; }
-        self.render_foot(&format!(
-            " Importing {} PDF(s) added on your phone \u{2014} structuring with Claude\u{2026}", n));
-        let _ = std::io::Write::flush(&mut std::io::stdout());
-        let (done, errs) = import::drain_inbox(&mut self.cat);
-        self.rebuild(None);
-        self.render_all();
-        let msg = if errs.is_empty() {
-            format!(" Imported {} book(s) from your phone.", done.len())
-        } else {
-            format!(" Imported {}; {} failed: {}", done.len(), errs.len(), errs.join("; "))
+    /// A unique book id that avoids both the catalog and in-flight imports.
+    fn unique_import_id(&self, title: &str) -> String {
+        let base = {
+            let s = store::slugify(title);
+            if s.is_empty() { "import".to_string() } else { s }
         };
-        self.render_foot(&msg);
+        let taken = |id: &str| self.cat.books.iter().any(|b| b.id == id)
+            || self.importing.iter().any(|(i, _, _)| i == id);
+        if !taken(&base) { return base; }
+        let mut n = 2;
+        loop {
+            let cand = format!("{}-{}", base, n);
+            if !taken(&cand) { return cand; }
+            n += 1;
+        }
     }
 
     /// Rebuild the display list from the catalog (category heading then
@@ -972,13 +1051,16 @@ impl App {
             // Block forever when idle (zero idle wakeups); while batches are
             // brewing, wake every second to tick the spinner and collect
             // finished work — so the UI stays fully interactive throughout.
-            let busy = self.gen_in_flight > 0 || !self.writing.is_empty();
+            let busy = self.gen_in_flight > 0 || !self.writing.is_empty() || !self.importing.is_empty();
             let timeout = if busy { Some(1) } else { None };
             let key = Input::getchr(timeout);
             self.drain_generations();
             self.drain_writes();
+            self.drain_imports();
             let Some(key) = key else {
-                if self.gen_in_flight > 0 || !self.writing.is_empty() { self.tick_spinner(); }
+                if self.gen_in_flight > 0 || !self.writing.is_empty() || !self.importing.is_empty() {
+                    self.tick_spinner();
+                }
                 continue;
             };
             match key.as_str() {
