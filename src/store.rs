@@ -51,6 +51,9 @@ pub struct Book {
     /// True if the written content is the longer "deep dive" form.
     #[serde(default)]
     pub deep: bool,
+    /// User has finished reading this book (the `R` mark on the shelf).
+    #[serde(default)]
+    pub read: bool,
     #[serde(default)]
     pub created_at: i64,
 }

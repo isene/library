@@ -63,6 +63,37 @@ type WriteResult = (String, Result<(), String>);
 /// finishes. The book is added to the catalog on the main thread.
 type ImportResult = (String, String, Result<Book, String>);
 
+/// Shelf filter, cycled with `f`. Orthogonal to the `/` text search.
+#[derive(Clone, Copy, PartialEq)]
+enum Filter { All, Rendered, Starred, Unread }
+
+impl Filter {
+    fn accepts(&self, b: &Book) -> bool {
+        match self {
+            Filter::All => true,
+            Filter::Rendered => b.written,
+            Filter::Starred => b.starred,
+            Filter::Unread => !b.read,
+        }
+    }
+    fn next(self) -> Self {
+        match self {
+            Filter::All => Filter::Rendered,
+            Filter::Rendered => Filter::Starred,
+            Filter::Starred => Filter::Unread,
+            Filter::Unread => Filter::All,
+        }
+    }
+    fn label(&self) -> &'static str {
+        match self {
+            Filter::All => "all",
+            Filter::Rendered => "rendered",
+            Filter::Starred => "starred",
+            Filter::Unread => "unread",
+        }
+    }
+}
+
 pub struct App {
     cols: u16,
     rows: u16,
@@ -92,6 +123,8 @@ pub struct App {
     /// don't collide. Inbox cleanup happens on the main thread after the
     /// catalog entry is added, so a quit mid-import never loses the queue.
     importing: Vec<(String, String, Option<std::path::PathBuf>)>,
+    /// Active shelf filter (cycled with `f`).
+    filter: Filter,
 }
 
 pub fn run() {
@@ -145,6 +178,7 @@ impl App {
             writing: HashSet::new(),
             import_tx, import_rx,
             importing: Vec::new(),
+            filter: Filter::All,
         };
         app.apply_border_state();
         app.rebuild(None);
@@ -387,7 +421,7 @@ impl App {
         for category in self.cat.categories() {
             // Books in this category that match the active search (if any).
             let hits: Vec<usize> = self.cat.books.iter().enumerate()
-                .filter(|(_, b)| b.category == category && book_matches(b, &q))
+                .filter(|(_, b)| b.category == category && book_matches(b, &q) && self.filter.accepts(b))
                 .map(|(i, _)| i)
                 .collect();
             if hits.is_empty() { continue; } // skip empty categories under a search
@@ -447,6 +481,52 @@ impl App {
         self.render_right();
     }
 
+    /// PgDn / PgUp — jump one pane-height of rows, snapping to the nearest
+    /// Book in the direction of travel (skips category headings).
+    fn page_sel(&mut self, down: bool) {
+        if self.entries.is_empty() { return; }
+        let page = (self.left.h as usize).max(1);
+        let n = self.entries.len();
+        let target = if down { (self.sel + page).min(n - 1) } else { self.sel.saturating_sub(page) };
+        let is_book = |i: &usize| matches!(self.entries[*i], Entry::Book(_));
+        let pick = if down {
+            (target..n).find(is_book).or_else(|| (0..=target).rev().find(is_book))
+        } else {
+            (0..=target).rev().find(is_book).or_else(|| (target..n).find(is_book))
+        };
+        if let Some(i) = pick { self.sel = i; }
+        self.render_left();
+        self.render_right();
+    }
+
+    /// `f` — cycle the shelf filter: all → rendered → starred → unread.
+    fn cycle_filter(&mut self) {
+        self.filter = self.filter.next();
+        self.rebuild(None);
+        self.render_all();
+        let n = self.entries.iter().filter(|e| matches!(e, Entry::Book(_))).count();
+        self.render_foot(&format!(" Filter: {} \u{2014} {} book(s) \u{00b7} f cycles", self.filter.label(), n));
+    }
+
+    /// `R` — toggle the "read" mark on the selected book (persisted).
+    fn toggle_read(&mut self) {
+        if let Some(i) = self.selected_book_idx() {
+            self.cat.books[i].read = !self.cat.books[i].read;
+            let now_read = self.cat.books[i].read;
+            let _ = self.cat.save();
+            // Under the Unread filter a freshly-read book leaves the list, so
+            // rebuild to drop it; otherwise just repaint the marker.
+            if self.filter == Filter::Unread && now_read {
+                self.rebuild(None);
+                self.render_all();
+            } else {
+                self.render_left();
+                self.render_right();
+            }
+            self.render_foot(if now_read { " Marked as read." } else { " Marked as unread." });
+        }
+    }
+
     fn render_all(&mut self) {
         self.render_top();
         self.render_left();
@@ -461,7 +541,8 @@ impl App {
         let marked = self.delete_marked.len();
         let mark_s = if marked > 0 { format!("  \u{00b7}  {} marked", marked) } else { String::new() };
         let search_s = if self.search.is_empty() { String::new() } else { format!("  \u{00b7}  /{}", self.search) };
-        let title = format!(" library   {} books \u{00b7} {} written{}{}", n, written, mark_s, search_s);
+        let filter_s = if self.filter == Filter::All { String::new() } else { format!("  \u{00b7}  [{}]", self.filter.label()) };
+        let title = format!(" library   {} books \u{00b7} {} written{}{}{}", n, written, mark_s, filter_s, search_s);
         // Right side: a live "brewing" indicator while batches generate in
         // the background. Keys live in the footer only (no duplicate map).
         let right = if self.gen_in_flight > 0 && !self.writing.is_empty() {
@@ -497,17 +578,21 @@ impl App {
                     let b = &self.cat.books[*bi];
                     let marked = self.delete_marked.contains(&b.id);
                     let selected = idx == self.sel;
-                    let title = trunc(&b.title, (self.list_w as usize).saturating_sub(4));
-                    // Star sits tight against the title — no padding columns to
-                    // get swept under the selection underline.
-                    let content = if b.starred { format!("\u{2605} {}", title) } else { title };
-                    // Colour: marked = dark red; real = gold, conjured = grey;
-                    // written books are brighter + bold (you can see what you own).
+                    let title = trunc(&b.title, (self.list_w as usize).saturating_sub(6));
+                    // Markers sit tight against the title — no padding columns to
+                    // get swept under the selection underline. ✓ = read, ★ = star.
+                    let mut content = String::new();
+                    if b.read { content.push_str("\u{2713} "); }
+                    if b.starred { content.push_str("\u{2605} "); }
+                    content.push_str(&title);
+                    // Colour: marked = dark red; read = dimmed (recedes); real =
+                    // gold, conjured = grey; written books are brighter + bold.
                     let color = if marked { col().del }
+                        else if b.read { col().dim }
                         else if b.kind == BookKind::Real { if b.written { col().real_bright } else { col().real } }
                         else if b.written { col().body_bright } else { col().body };
                     let mut styled = style::fg(&content, color);
-                    if b.written { styled = style::bold(&styled); }
+                    if b.written && !b.read { styled = style::bold(&styled); }
                     if selected { styled = style::underline(&styled); }
                     // Pointer-style: a cyan arrow, one plain space, the title.
                     let arrow = if selected { style::fg("\u{2192}", col().sel) } else { " ".to_string() };
@@ -1086,9 +1171,13 @@ impl App {
                 "q" | "ESC" => break,
                 "j" | "DOWN" => self.move_sel(true),
                 "k" | "UP" => self.move_sel(false),
+                "PgDOWN" => self.page_sel(true),
+                "PgUP" => self.page_sel(false),
                 "g" | "HOME" => self.go_edge(false),
                 "G" | "END" => self.go_edge(true),
                 "*" => self.toggle_star(),
+                "f" => self.cycle_filter(),
+                "R" => self.toggle_read(),
                 "d" => self.toggle_delete(),
                 "<" => self.purge_marked(),
                 "+" => self.request_more(false),
