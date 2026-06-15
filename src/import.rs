@@ -161,11 +161,216 @@ fn render_figures(pdf: &Path, id: &str, md: &str) -> String {
     out
 }
 
-/// Build a live book from a PDF without touching the catalog: extract text,
-/// restructure via Claude, render figure pages, write `books/<id>/book.md`
-/// (+ `img/`), and return the `Book` (kind=real, written=true) for the
-/// caller to add. `id` must already be unique on the shelf.
-pub fn build_book(pdf: &Path, id: &str, title: &str, subject: &str, author: &str)
+/// Build a live book from a PDF or EPUB without touching the catalog. EPUB
+/// is preferred where available: pandoc converts its structured XHTML to
+/// clean Markdown (exact chapters, real embedded figures) instantly with no
+/// Claude pass. `id` must already be unique on the shelf.
+pub fn build_book(doc: &Path, id: &str, title: &str, subject: &str, author: &str)
+    -> Result<Book, String>
+{
+    if is_epub(doc) {
+        build_book_epub(doc, id, title, subject, author)
+    } else {
+        build_book_pdf(doc, id, title, subject, author)
+    }
+}
+
+/// EPUB → Markdown via pandoc (structured XHTML → exact headings + extracted
+/// images), then mechanical cleanup. No Claude: pandoc already produces clean
+/// reflowable Markdown, so this is instant and faithful.
+fn build_book_epub(epub: &Path, id: &str, title: &str, subject: &str, author: &str)
+    -> Result<Book, String>
+{
+    let tmp = std::env::temp_dir().join(format!("lib-epub-{}-{}", std::process::id(), id));
+    let _ = std::fs::create_dir_all(&tmp);
+    let media = tmp.join("media");
+    let md_path = tmp.join("book.md");
+    // -raw_html drops the epub's <span> page-break/anchor cruft; --wrap=none
+    // keeps each paragraph on one line (our reader reflows).
+    let status = std::process::Command::new("pandoc")
+        .arg(epub)
+        .args(["-f", "epub", "-t", "gfm-raw_html", "--wrap=none"])
+        .arg(format!("--extract-media={}", media.display()))
+        .arg("-o").arg(&md_path)
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map_err(|e| format!("pandoc: {} — install pandoc", e))?;
+    if !status.success() {
+        let _ = std::fs::remove_dir_all(&tmp);
+        return Err("pandoc failed to convert the epub".into());
+    }
+    let raw = std::fs::read_to_string(&md_path).map_err(|e| format!("read pandoc md: {}", e))?;
+    if raw.chars().filter(|c| !c.is_whitespace()).count() < 40 {
+        let _ = std::fs::remove_dir_all(&tmp);
+        return Err("epub produced no text".into());
+    }
+    std::fs::create_dir_all(store::book_dir(id)).map_err(|e| format!("mkdir: {}", e))?;
+    let cleaned = clean_epub_markdown(&raw, id, title);
+    let hook = hook_from(&cleaned);
+    let cleaned = crate::mathrender::render_math(id, &cleaned);
+    std::fs::write(store::book_md(id), cleaned.as_bytes())
+        .map_err(|e| format!("write book.md: {}", e))?;
+    let _ = std::fs::remove_dir_all(&tmp);
+
+    let subject = subject.trim();
+    Ok(Book {
+        id: id.to_string(),
+        title: title.to_string(),
+        author: author.trim().to_string(),
+        category: if subject.is_empty() { "Imported".into() } else { subject.to_string() },
+        hook,
+        kind: BookKind::Real,
+        written: true,
+        created_at: store::now_secs(),
+        ..Default::default()
+    })
+}
+
+/// Mechanical cleanup of pandoc's epub Markdown: drop wrapping `**` on
+/// headings and bare page-number/roman headings; turn block images into
+/// `[[FIG n]]` (copied to `img/figN.png`, cover dropped); strip inline image
+/// markup (publisher-rasterised math glyphs). Prepends a `# {title}` heading.
+fn clean_epub_markdown(raw: &str, id: &str, title: &str) -> String {
+    let img_dir = store::book_img_dir(id);
+    let _ = std::fs::create_dir_all(&img_dir);
+    let mut fig = 1usize;
+    let mut eq = 1usize;
+    let mut out = String::new();
+    out.push_str(&format!("# {}\n\n", title.trim()));
+    let mut blanks = 1usize;
+    for line in raw.lines() {
+        let t = line.trim();
+        if let Some((hashes, rest)) = heading_split(t) {
+            let rest = strip_heading_bold(rest);
+            if rest.is_empty() || is_bare_label(rest) { continue; }
+            push_line(&mut out, &mut blanks, &format!("{} {}", hashes, rest));
+            continue;
+        }
+        if let Some((alt, path)) = parse_block_image(t) {
+            if is_cover(&alt, &path) { continue; }
+            // Publishers rasterise math as images. A short or very-wide image
+            // is a displayed equation → render it small + centred as [[EQ]];
+            // a tall image is a real figure → full-width [[FIG]].
+            let (w, h) = image_dims(&path).unwrap_or((0, 0));
+            let is_equation = h > 0 && (h < 140 || w as f32 > 3.0 * h as f32);
+            if is_equation {
+                if convert_img(&path, &img_dir.join(format!("eq{}.png", eq))) {
+                    push_line(&mut out, &mut blanks, &format!("[[EQ {}]]", eq));
+                    eq += 1;
+                }
+            } else if convert_img(&path, &img_dir.join(format!("fig{}.png", fig))) {
+                push_line(&mut out, &mut blanks, &format!("[[FIG {}: {}]]", fig, alt));
+                fig += 1;
+            }
+            continue;
+        }
+        push_line(&mut out, &mut blanks, &strip_inline_images(line));
+    }
+    out
+}
+
+fn heading_split(t: &str) -> Option<(&str, &str)> {
+    let h = t.len() - t.trim_start_matches('#').len();
+    if (1..=6).contains(&h) && t[h..].starts_with(' ') {
+        Some((&t[..h], t[h + 1..].trim()))
+    } else {
+        None
+    }
+}
+
+fn strip_heading_bold(s: &str) -> &str {
+    let s = s.trim();
+    if s.len() >= 4 && s.starts_with("**") && s.ends_with("**") {
+        s[2..s.len() - 2].trim()
+    } else {
+        s
+    }
+}
+
+/// A heading that's just a page/chapter number or a short lowercase roman
+/// numeral (front-matter labels) — dropped, keeping the real title heading.
+fn is_bare_label(s: &str) -> bool {
+    let s = s.trim();
+    if s.is_empty() { return true; }
+    if s.chars().all(|c| c.is_ascii_digit() || ".:- ".contains(c)) { return true; }
+    s.len() <= 6 && s.chars().all(|c| "ivxlcdm".contains(c))
+}
+
+/// Parse a line that is exactly `![alt](path)` (a block image).
+fn parse_block_image(t: &str) -> Option<(String, String)> {
+    if !t.starts_with("![") || !t.ends_with(')') { return None; }
+    let alt_end = t.find("](")?;
+    let alt = &t[2..alt_end];
+    let path = &t[alt_end + 2..t.len() - 1];
+    if alt.contains('[') || path.contains('(') || path.contains("](") { return None; }
+    Some((alt.to_string(), path.to_string()))
+}
+
+fn is_cover(alt: &str, path: &str) -> bool {
+    if alt.eq_ignore_ascii_case("cover") { return true; }
+    let stem = Path::new(path).file_stem().and_then(|s| s.to_str()).unwrap_or("");
+    stem.len() >= 8 && stem.chars().all(|c| c.is_ascii_digit())
+}
+
+/// Image dimensions via ImageMagick `identify`.
+fn image_dims(path: &str) -> Option<(u32, u32)> {
+    let out = std::process::Command::new("identify")
+        .args(["-format", "%w %h"]).arg(path).output().ok()?;
+    if !out.status.success() { return None; }
+    let s = String::from_utf8_lossy(&out.stdout);
+    let mut it = s.split_whitespace();
+    Some((it.next()?.parse().ok()?, it.next()?.parse().ok()?))
+}
+
+/// Convert an extracted image (any format) to `dst` as PNG, shrinking only
+/// if larger than 700px so figure sync size stays bounded.
+fn convert_img(src: &str, dst: &Path) -> bool {
+    std::process::Command::new("convert")
+        .arg(src).args(["-resize", "700x700>"]).arg(dst)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+        && dst.exists()
+}
+
+/// Remove every inline `![alt](path)` from a line, keeping the prose.
+fn strip_inline_images(line: &str) -> String {
+    let mut out = String::new();
+    let mut rest = line;
+    loop {
+        let Some(start) = rest.find("![") else { out.push_str(rest); break; };
+        let Some(mid_rel) = rest[start..].find("](") else { out.push_str(rest); break; };
+        let mid = start + mid_rel;
+        let Some(end_rel) = rest[mid + 2..].find(')') else { out.push_str(rest); break; };
+        out.push_str(&rest[..start]);
+        rest = &rest[mid + 2 + end_rel + 1..];
+    }
+    out
+}
+
+/// Append a line, collapsing runs of blank lines to a single separator.
+fn push_line(out: &mut String, blanks: &mut usize, line: &str) {
+    if line.trim().is_empty() {
+        if *blanks == 0 { out.push('\n'); }
+        *blanks += 1;
+    } else {
+        out.push_str(line.trim_end());
+        out.push('\n');
+        *blanks = 0;
+    }
+}
+
+fn is_epub(p: &Path) -> bool {
+    p.extension().and_then(|x| x.to_str())
+        .map(|x| x.eq_ignore_ascii_case("epub"))
+        .unwrap_or(false)
+}
+
+/// Build a live book from a PDF: pdftotext → Claude restructure → figure
+/// pages + equations → `books/<id>/book.md`.
+fn build_book_pdf(pdf: &Path, id: &str, title: &str, subject: &str, author: &str)
     -> Result<Book, String>
 {
     let raw = extract_text(pdf)?;
@@ -231,7 +436,7 @@ fn is_pdf(p: &Path) -> bool {
 /// Queued inbox PDFs (sorted), each optionally paired with a `<stem>.json`.
 pub fn inbox_pdfs() -> Vec<PathBuf> {
     let mut v: Vec<PathBuf> = match std::fs::read_dir(inbox_dir()) {
-        Ok(rd) => rd.flatten().map(|e| e.path()).filter(|p| is_pdf(p)).collect(),
+        Ok(rd) => rd.flatten().map(|e| e.path()).filter(|p| is_pdf(p) || is_epub(p)).collect(),
         Err(_) => return Vec::new(),
     };
     v.sort();

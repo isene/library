@@ -237,7 +237,7 @@ impl App {
     /// live book). The UI stays interactive; the book lands via
     /// `drain_imports` when ready, exactly like a grabbed conjured book.
     fn import_book(&mut self) {
-        let raw_path = self.foot.ask("Import PDF \u{2014} path: ", "");
+        let raw_path = self.foot.ask("Import PDF/EPUB \u{2014} path: ", "");
         if self.foot.last_escaped || raw_path.trim().is_empty() { self.render_foot(""); return; }
         let pdf = import::expand_tilde(raw_path.trim());
         if !pdf.exists() {

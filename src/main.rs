@@ -127,7 +127,7 @@ fn cmd_import() {
             import::inbox_dir().display());
         return;
     }
-    eprintln!("importing {} PDF(s) — structuring with Claude…", n);
+    eprintln!("importing {} document(s)…", n);
     let (done, errs) = import::drain_inbox(&mut cat);
     for t in &done { eprintln!("  ✓ {}", t); }
     for e in &errs { eprintln!("  ✗ {}", e); }
@@ -199,8 +199,8 @@ fn print_help() {
          library --seed \"<interests>\" [--n N]   stock the shelves from an interest blurb\n\
          library --more \"<topic>\"     [--n N]   add more books on a topic\n\
          library --list                          print the current shelf\n\
-         library --import                        import PDFs queued in ~/.library/inbox/\n\
-         library                                 browse (TUI; press 'a' to add a PDF)\n\n\
+         library --import                        import PDFs/EPUBs queued in ~/.library/inbox/\n\
+         library                                 browse (TUI; press 'a' to add a PDF/EPUB)\n\n\
          Data lives in ~/.library/ (catalog.json + books/<id>/)."
     );
 }
