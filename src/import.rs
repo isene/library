@@ -20,9 +20,9 @@ use crate::claude;
 use crate::store::{self, Book, BookKind, Catalog};
 
 /// Cap on rendered figure pages per book — keeps a diagram-dense book from
-/// syncing dozens of MB of page PNGs to the phone. Excess markers are
-/// dropped (and logged by the caller via the returned count, if wanted).
-const MAX_FIGS: usize = 60;
+/// syncing many MB of page PNGs to the phone. With caption-only detection a
+/// real book rarely approaches this; excess markers are dropped.
+const MAX_FIGS: usize = 25;
 
 pub fn inbox_dir() -> PathBuf { store::root().join("inbox") }
 
@@ -97,7 +97,7 @@ fn hook_from(text: &str) -> String {
 fn render_page(pdf: &Path, img_dir: &Path, page: usize, k: usize) -> bool {
     let prefix = img_dir.join(format!("fig{}", k)); // pdftoppm -singlefile → <prefix>.png
     std::process::Command::new("pdftoppm")
-        .args(["-png", "-r", "130", "-singlefile",
+        .args(["-png", "-r", "110", "-singlefile",
                "-f", &page.to_string(), "-l", &page.to_string()])
         .arg(pdf)
         .arg(&prefix)
@@ -175,6 +175,9 @@ pub fn build_book(pdf: &Path, id: &str, title: &str, subject: &str, author: &str
 
     std::fs::create_dir_all(store::book_dir(id))
         .map_err(|e| format!("mkdir {}: {}", store::book_dir(id).display(), e))?;
+    // Equations first (LaTeX → eq{n}.png + inline Unicode), then figure pages
+    // (eq/fig namespaces are separate, so numbering never collides).
+    let md = crate::mathrender::render_math(id, &md);
     let md = render_figures(pdf, id, &md);
     std::fs::write(store::book_md(id), md.as_bytes())
         .map_err(|e| format!("write book.md: {}", e))?;

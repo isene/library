@@ -15,6 +15,7 @@ mod bookmark;
 mod claude;
 mod export;
 mod import;
+mod mathrender;
 mod store;
 mod tui;
 
@@ -33,6 +34,7 @@ fn main() {
             "--list" => { mode = Some("list"); i += 1; }
             "--pdf" if i + 1 < args.len() => { mode = Some("pdf"); text = args[i + 1].clone(); i += 2; }
             "--import" => { mode = Some("import"); i += 1; }
+            "--remath" if i + 1 < args.len() => { mode = Some("remath"); text = args[i + 1].clone(); i += 2; }
             "--n" if i + 1 < args.len() => { n = args[i + 1].parse().unwrap_or(n); i += 2; }
             "-h" | "--help" => { print_help(); return; }
             _ => { i += 1; }
@@ -45,6 +47,7 @@ fn main() {
         Some("list") => print_shelf(&Catalog::load()),
         Some("pdf") => cmd_pdf(&text),
         Some("import") => cmd_import(),
+        Some("remath") => cmd_remath(&text),
         _ => tui::run(),
     }
 }
@@ -130,6 +133,34 @@ fn cmd_import() {
     for e in &errs { eprintln!("  ✗ {}", e); }
     eprintln!("done: {} imported, {} failed. shelf now holds {}.",
         done.len(), errs.len(), cat.books.len());
+}
+
+/// Re-render the LaTeX math already present in a written book's `book.md`
+/// into `[[EQ n]]` images, in place — no Claude, just LaTeX → PNG. Useful
+/// after the importer gains math support, or to refresh equations.
+fn cmd_remath(id_or_title: &str) {
+    let cat = Catalog::load();
+    let Some(book) = cat.books.iter()
+        .find(|b| b.id == id_or_title || store::slugify(&b.title) == store::slugify(id_or_title))
+    else {
+        eprintln!("no book with id/title '{}'", id_or_title);
+        std::process::exit(1);
+    };
+    let path = store::book_md(&book.id);
+    let md = std::fs::read_to_string(&path).unwrap_or_default();
+    if md.trim().is_empty() {
+        eprintln!("'{}' has no written content", book.title);
+        std::process::exit(1);
+    }
+    let before = md.matches("$$").count() / 2;
+    eprintln!("rendering {} display equation(s) in '{}'…", before, book.title);
+    let rendered = mathrender::render_math(&book.id, &md);
+    if let Err(e) = std::fs::write(&path, rendered.as_bytes()) {
+        eprintln!("write failed: {}", e);
+        std::process::exit(1);
+    }
+    let eqs = std::fs::read_to_string(&path).unwrap_or_default().matches("[[EQ ").count();
+    eprintln!("done: {} equation image(s) now in {}", eqs, store::book_img_dir(&book.id).display());
 }
 
 /// Print the shelf grouped by category — the read-only stand-in until

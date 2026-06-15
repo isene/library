@@ -30,7 +30,19 @@ pub fn run_claude(prompt: &str, model: &str) -> Result<String, String> {
     }
     let out = child.wait_with_output().map_err(|e| format!("wait: {}", e))?;
     if !out.status.success() {
-        return Err(format!("claude failed: {}", String::from_utf8_lossy(&out.stderr).trim()));
+        // The CLI prints API/policy errors to stdout, not stderr, so fall
+        // back to stdout when stderr is empty — otherwise the failure looks
+        // like a blank "claude failed:".
+        let err = String::from_utf8_lossy(&out.stderr);
+        let so = String::from_utf8_lossy(&out.stdout);
+        let detail = if !err.trim().is_empty() {
+            err.trim().to_string()
+        } else {
+            so.trim().chars().take(300).collect::<String>()
+        };
+        return Err(format!("claude exited {}: {}",
+            out.status.code().map(|c| c.to_string()).unwrap_or_else(|| "signal".into()),
+            detail));
     }
     Ok(String::from_utf8_lossy(&out.stdout).to_string())
 }
@@ -151,7 +163,8 @@ pub fn write_book(title: &str, hook: &str, category: &str, deep: bool) -> Result
          that earns the reader's attention and close with a resonant ending.\n\n\
          Use Markdown: a single top-level '# {title}' heading, '## ' chapter \
          headings, flowing prose paragraphs (*italic*, **bold**, and '>' \
-         pull-quotes are fine).\n\n\
+         pull-quotes are fine). For any mathematics, use LaTeX: displayed \
+         equations as `$$ … $$` on their own line, inline math as `$ … $`.\n\n\
          ILLUSTRATIONS: include 2-4 simple, genuinely useful figures \u{2014} \
          clean diagrams/schematics that aid understanding, never decoration. \
          In the prose, put a marker line `[[FIG n: short caption]]` on its own \
@@ -218,19 +231,68 @@ fn strip_code_fences(s: &str) -> String {
 }
 
 const IMPORT_MODEL: &str = "claude-sonnet-4-6";
+/// How many chunks to structure concurrently. The bottleneck is `claude -p`
+/// process cold-start, so overlapping calls is the big win; 6 keeps memory
+/// and API concurrency sane. A 400-page book drops from hours to ~20 min.
+const IMPORT_PARALLELISM: usize = 6;
 
 /// Re-render raw `pdftotext` output into clean, readable Markdown for an
-/// imported book. Long inputs are processed in paragraph-aligned chunks:
-/// a model response is output-capped, so a whole long book can't come back
-/// in one shot. The first chunk carries the `# {title}` heading; later
-/// chunks continue without re-adding it. Content is preserved verbatim in
-/// meaning — never summarised, never invented.
+/// imported book. Long inputs are split into paragraph-aligned chunks (a
+/// model response is output-capped) and structured concurrently, then
+/// reassembled in order. The first chunk carries the `# {title}` heading;
+/// later chunks continue without re-adding it. Content is preserved verbatim
+/// in meaning — never summarised, never invented.
 pub fn structure_pdf(title: &str, author: &str, raw: &str) -> Result<String, String> {
-    let chunks = chunk_text(raw, 12000);
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    let chunks = Arc::new(chunk_text(raw, 16000));
     let total = chunks.len();
+    if total == 0 { return Err("structuring produced no text".into()); }
+
+    // Slot per chunk, filled by whichever worker processes that index.
+    let results: Arc<Mutex<Vec<Option<Result<String, String>>>>> =
+        Arc::new(Mutex::new((0..total).map(|_| None).collect()));
+    let next = Arc::new(AtomicUsize::new(0));
+    let title = Arc::new(title.to_string());
+    let author = Arc::new(author.to_string());
+
+    let workers = IMPORT_PARALLELISM.min(total);
+    let mut handles = Vec::with_capacity(workers);
+    for _ in 0..workers {
+        let chunks = chunks.clone();
+        let results = results.clone();
+        let next = next.clone();
+        let title = title.clone();
+        let author = author.clone();
+        handles.push(std::thread::spawn(move || loop {
+            let i = next.fetch_add(1, Ordering::Relaxed);
+            if i >= chunks.len() { break; }
+            // Up to 3 tries: a 90-chunk job shouldn't die on one transient
+            // rate-limit / network blip.
+            let mut r = structure_chunk(&title, &author, &chunks[i], i == 0, i + 1, chunks.len());
+            let mut tries = 1;
+            while r.is_err() && tries < 3 {
+                std::thread::sleep(std::time::Duration::from_secs(2 * tries));
+                r = structure_chunk(&title, &author, &chunks[i], i == 0, i + 1, chunks.len());
+                tries += 1;
+            }
+            results.lock().unwrap()[i] = Some(r);
+        }));
+    }
+    for h in handles { let _ = h.join(); }
+
+    let results = Arc::try_unwrap(results).ok()
+        .and_then(|m| m.into_inner().ok())
+        .ok_or_else(|| "internal: results lock poisoned".to_string())?;
+
     let mut out = String::new();
-    for (i, chunk) in chunks.iter().enumerate() {
-        let md = structure_chunk(title, author, chunk, i == 0, i + 1, total)?;
+    for (i, slot) in results.into_iter().enumerate() {
+        let md = match slot {
+            Some(Ok(md)) => md,
+            Some(Err(e)) => return Err(format!("chunk {}/{}: {}", i + 1, total, e)),
+            None => return Err(format!("chunk {}/{} was not processed", i + 1, total)),
+        };
         let md = md.trim();
         if md.is_empty() { continue; }
         if !out.is_empty() { out.push_str("\n\n"); }
@@ -261,12 +323,21 @@ fn structure_chunk(title: &str, author: &str, chunk: &str, first: bool, n: usize
          - Drop page numbers, running headers/footers, and other layout cruft.\n\
          - Add '## ' headings only where a real chapter or section heading actually \
            occurs in the text.\n\
-         - FIGURES: wherever the book has a figure, diagram, illustration, chart, or \
-           table (a captioned float, or a clearly-drawn diagram the prose discusses), \
-           emit a line `[[FIGPAGE n: short caption]]` on its own line at that spot, \
-           where n is the number from the nearest preceding \u{27e6}PAGE n\u{27e7} \
-           marker. Be conservative: only mark figures clearly present, not every \
-           passing mention. Reuse the figure's own caption text where it has one.\n\
+         - MATH: `pdftotext` mangles equations. Where the text clearly contains a \
+           mathematical equation or expression, reconstruct it as LaTeX: wrap a \
+           displayed equation as `$$ … $$` on its own line, and inline math as \
+           `$ … $`. Only do this where you are confident of the maths; if the \
+           original is too garbled to reconstruct faithfully, leave it as plain \
+           text rather than guessing.\n\
+         - FIGURES: only when the book has an explicitly LABELLED figure or table — \
+           one whose own caption begins with a label such as \"Figure 3.1\", \
+           \"Fig. 2\", \"Table 4\", \"Plate 1\", \"Chart 2\" — emit a line \
+           `[[FIGPAGE n: the caption text]]` on its own line where that float \
+           appears, with n from the nearest preceding \u{27e6}PAGE n\u{27e7} marker. \
+           Be VERY conservative: do NOT mark uncaptioned inline diagrams, equations, \
+           passing mentions of a figure, or decorative art. If there is no explicit \
+           \"Figure N\"/\"Table N\"-style caption, emit nothing. Most pages have no \
+           figure marker at all.\n\
          - Do NOT include the \u{27e6}PAGE n\u{27e7} markers themselves in your output.\n\
          - {head}\n\
          Preserve ALL the prose and its meaning. Do NOT summarise, omit, paraphrase, \

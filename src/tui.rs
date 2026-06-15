@@ -343,6 +343,23 @@ impl App {
         }
     }
 
+    /// `y` — copy the selected book's `book.md` path to the clipboard
+    /// (OSC 52 + xclip fallback, via crust). Lets you open it elsewhere.
+    fn copy_book_path(&mut self) {
+        let Some(id) = self.selected_book_id() else {
+            self.render_foot(" No book selected.");
+            return;
+        };
+        let path = store::book_md(&id);
+        if !path.exists() {
+            self.render_foot(" Not written yet \u{2014} grab it first, then y copies its path.");
+            return;
+        }
+        let p = path.to_string_lossy().to_string();
+        crust::clipboard_copy(&p, "clipboard");
+        self.render_foot(&format!(" Copied path: {}", p));
+    }
+
     /// A unique book id that avoids both the catalog and in-flight imports.
     fn unique_import_id(&self, title: &str) -> String {
         let base = {
@@ -735,7 +752,6 @@ impl App {
             let res = claude::write_book(&title, &hook, &category, deep).and_then(|raw| {
                 let (md, figs) = claude::parse_book(&raw);
                 std::fs::create_dir_all(store::book_dir(&id)).map_err(|e| e.to_string())?;
-                std::fs::write(store::book_md(&id), md).map_err(|e| e.to_string())?;
                 let img = store::book_img_dir(&id);
                 let _ = std::fs::create_dir_all(&img);
                 for (n, svg) in figs {
@@ -748,6 +764,9 @@ impl App {
                             .status();
                     }
                 }
+                // Render LaTeX equations (eq{n}.png) + inline Unicode, then write.
+                let md = crate::mathrender::render_math(&id, &md);
+                std::fs::write(store::book_md(&id), md).map_err(|e| e.to_string())?;
                 Ok(())
             });
             let _ = tx.send((id, res));
@@ -1076,6 +1095,7 @@ impl App {
                 "s" => self.request_more(true),
                 "i" => self.edit_interests(),
                 "a" => self.import_book(),
+                "y" => self.copy_book_path(),
                 "w" => self.cycle_width(true),
                 "W" => self.cycle_width(false),
                 "C-B" => self.cycle_border(),
@@ -1107,6 +1127,9 @@ impl App {
 struct FigPos { line: usize, png: std::path::PathBuf, rows: usize }
 
 const FIG_ROWS: usize = 18;
+/// Rows reserved for a rendered equation image — shorter than a figure;
+/// glow fits the image to its aspect within the box.
+const EQ_ROWS: usize = 6;
 
 /// Render a book's Markdown into styled, wrapped display lines plus the
 /// inline figures. Headings are coloured/bold; `>` lines are dimmed
@@ -1144,6 +1167,21 @@ fn render_markdown(md: &str, width: usize, img_dir: &std::path::Path, images_ok:
     for raw in md.lines() {
         let line = raw.trim_end();
         let trimmed = line.trim();
+        if let Some(inner) = trimmed.strip_prefix("[[EQ").and_then(|r| r.strip_suffix("]]")) {
+            if let Ok(n) = inner.trim().parse::<usize>() {
+                let png = img_dir.join(format!("eq{}.png", n));
+                out.push(String::new());
+                if images_ok && png.exists() {
+                    let start = out.len();
+                    for _ in 0..EQ_ROWS { out.push(String::new()); }
+                    figs.push(FigPos { line: start, png, rows: EQ_ROWS });
+                } else if !png.exists() {
+                    out.push(style::fg("   (equation unavailable)", col().dim));
+                }
+                out.push(String::new());
+                continue;
+            }
+        }
         if let Some(inner) = trimmed.strip_prefix("[[FIG").and_then(|r| r.strip_suffix("]]")) {
             let inner = inner.trim();
             let (n_str, caption) = match inner.split_once(':') {
