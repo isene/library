@@ -94,6 +94,42 @@ impl Filter {
     }
 }
 
+/// Key help shown by `?` in the shelf view.
+const SHELF_HELP: &[(&str, &str)] = &[
+    ("j / k  \u{2191}\u{2193}", "move (books and shelf headers)"),
+    ("PgDn / PgUp", "page through the shelf"),
+    ("g / G", "first / last"),
+    ("\u{21b5} / \u{2192}", "open book (on a header: enter shelf)"),
+    ("/", "search"),
+    ("f", "filter: all / rendered / starred / unread"),
+    ("* / R", "star / mark read"),
+    ("Ctrl+\u{2191}/\u{2193}", "reorder book (on a header: move shelf)"),
+    ("M", "move book to a shelf (new name = new shelf)"),
+    ("a / y", "add a PDF/EPUB / copy book path"),
+    ("d / <", "mark / purge deletion"),
+    ("+ / s", "generate more / seed books"),
+    ("i", "edit interests"),
+    ("w / W", "shelf-pane width"),
+    ("Ctrl+B / P", "border / colours"),
+    ("r / ?", "reload / this help"),
+    ("q", "quit"),
+];
+
+/// Key help shown by `?` in the reader.
+const READER_HELP: &[(&str, &str)] = &[
+    ("j / k", "scroll a line"),
+    ("Space / b", "page down / up"),
+    ("g / G", "top / bottom"),
+    ("w / W", "reading width"),
+    ("m", "set bookmark"),
+    ("e", "export PDF"),
+    ("c", "discuss with Claude"),
+    ("d", "define highlighted term"),
+    ("+", "deepen (longer rewrite)"),
+    ("P", "colours"),
+    ("? / q", "this help / back to shelf"),
+];
+
 pub struct App {
     cols: u16,
     rows: u16,
@@ -453,19 +489,14 @@ impl App {
         self.selected_book_idx().map(|i| self.cat.books[i].id.clone())
     }
 
-    /// Move selection to the next/prev Book entry, skipping headings.
+    /// Move the selection one entry — a book OR a shelf header (headers are
+    /// landable so Ctrl+Up/Down can move a whole shelf).
     fn move_sel(&mut self, down: bool) {
         if self.entries.is_empty() { return; }
-        let mut i = self.sel;
-        loop {
-            if down {
-                if i + 1 >= self.entries.len() { break; }
-                i += 1;
-            } else {
-                if i == 0 { break; }
-                i -= 1;
-            }
-            if matches!(self.entries[i], Entry::Book(_)) { self.sel = i; break; }
+        if down {
+            if self.sel + 1 < self.entries.len() { self.sel += 1; }
+        } else {
+            self.sel = self.sel.saturating_sub(1);
         }
         self.render_left();
         self.render_right();
@@ -596,6 +627,79 @@ impl App {
         self.render_foot(&format!(" Moved to \u{201c}{}\u{201d}.", target));
     }
 
+    /// The category whose header is selected, or None when a book is selected.
+    fn selected_category(&self) -> Option<String> {
+        match self.entries.get(self.sel) {
+            Some(Entry::Header(c)) => Some(c.clone()),
+            _ => None,
+        }
+    }
+
+    /// Ctrl+Up / Ctrl+Down on a shelf header — move that whole shelf up or
+    /// down in the shelf order. Regroups the catalog by the new order,
+    /// preserving each shelf's internal book order. Persisted.
+    fn move_shelf(&mut self, down: bool) {
+        let (cat, book_id) = match self.entries.get(self.sel) {
+            Some(Entry::Header(c)) => (c.clone(), None),
+            Some(Entry::Book(i)) => (self.cat.books[*i].category.clone(), Some(self.cat.books[*i].id.clone())),
+            None => return,
+        };
+        let cats = self.cat.categories();
+        let Some(pos) = cats.iter().position(|c| *c == cat) else { return; };
+        if down && pos + 1 >= cats.len() { self.render_foot(" Shelf already at the bottom."); return; }
+        if !down && pos == 0 { self.render_foot(" Shelf already at the top."); return; }
+        let target = if down { pos + 1 } else { pos - 1 };
+        let mut order = cats;
+        order.swap(pos, target);
+        let rank: std::collections::HashMap<String, usize> =
+            order.iter().enumerate().map(|(i, c)| (c.clone(), i)).collect();
+        // Stable sort by shelf rank keeps each shelf's books in their order.
+        let mut books = std::mem::take(&mut self.cat.books);
+        books.sort_by_key(|b| *rank.get(&b.category).unwrap_or(&usize::MAX));
+        self.cat.books = books;
+        let _ = self.cat.save();
+        self.rebuild(book_id);
+        // If we moved from the header, follow it to its new position.
+        if self.selected_category().as_deref() != Some(&cat) {
+            if let Some(p) = self.entries.iter().position(|e| matches!(e, Entry::Header(c) if *c == cat)) {
+                self.sel = p;
+            }
+        }
+        self.render_all();
+        self.render_foot(&format!(" Moved shelf \u{201c}{}\u{201d} {}.",
+            cat, if down { "down" } else { "up" }));
+    }
+
+    /// Render a centred key-help popup (any key closes it). Shared by the
+    /// shelf `?` and the reader `?`.
+    fn show_help(&self, title: &str, rows: &[(&str, &str)]) {
+        let kw = rows.iter().map(|(k, _)| k.chars().count()).max().unwrap_or(6);
+        let cw = rows.iter()
+            .map(|(k, d)| kw + 2 + d.chars().count())
+            .max().unwrap_or(24)
+            .max(title.chars().count());
+        let pw = ((cw as u16) + 4).min(self.cols.saturating_sub(2)).max(24);
+        let ph = ((rows.len() as u16) + 5).min(self.rows.saturating_sub(2)).max(6);
+        let px = self.cols.saturating_sub(pw) / 2 + 1;
+        let py = self.rows.saturating_sub(ph) / 2 + 1;
+        let mut pane = Pane::new(px, py, pw, ph, col().body as u16, col().bar_bg as u16);
+        pane.scroll = false;
+        pane.wrap = false;
+        pane.border = true;
+        pane.border_fg = Some(col().border as u16);
+        let mut s = style::bold(&style::fg(&format!(" {}", title), col().sel));
+        s.push_str("\n\n");
+        for (k, d) in rows {
+            s.push_str(&format!(" {}  {}\n",
+                style::bold(&style::fg(&format!("{:>kw$}", k, kw = kw), col().header)),
+                style::fg(d, col().body)));
+        }
+        s.push_str(&style::fg("\n Press any key to close.", col().dim));
+        pane.say(&s);
+        pane.border_refresh();
+        let _ = Input::getchr(None);
+    }
+
     fn render_all(&mut self) {
         self.render_top();
         self.render_left();
@@ -641,7 +745,12 @@ impl App {
         for idx in self.top_row..end {
             match &self.entries[idx] {
                 Entry::Header(c) => {
-                    lines.push_str(&style::bold(&style::fg(&format!("{}", c), col().header)));
+                    let selected = idx == self.sel;
+                    let mut name = style::bold(&style::fg(c, col().header));
+                    if selected { name = style::underline(&name); }
+                    // Shared arrow column with the book rows so selection lines up.
+                    let arrow = if selected { style::fg("\u{2192} ", col().sel) } else { "  ".to_string() };
+                    lines.push_str(&format!("{}{}", arrow, name));
                 }
                 Entry::Book(bi) => {
                     let b = &self.cat.books[*bi];
@@ -677,6 +786,27 @@ impl App {
     fn render_right(&mut self) {
         let w = self.right.w as usize;
         let mut out = String::new();
+        if let Some(cat) = self.selected_category() {
+            // Shelf header selected: show a summary of the shelf.
+            let books: Vec<&Book> = self.cat.books.iter().filter(|b| b.category == cat).collect();
+            let written = books.iter().filter(|b| b.written).count();
+            let read = books.iter().filter(|b| b.read).count();
+            out.push_str(&style::bold(&style::fg(&wrap(&cat, w), col().header)));
+            out.push_str("\n\n");
+            out.push_str(&style::fg(&format!("{} book(s) \u{00b7} {} rendered \u{00b7} {} read",
+                books.len(), written, read), col().dim));
+            out.push_str("\n\n");
+            for b in &books {
+                let mark = if b.read { "\u{2713} " } else if b.starred { "\u{2605} " } else { "  " };
+                out.push_str(&style::fg(&format!("{}{}", mark, trunc(&b.title, w.saturating_sub(3))), col().body));
+                out.push('\n');
+            }
+            out.push_str(&style::fg("\n Ctrl+\u{2191}/\u{2193} moves this shelf \u{00b7} \u{21b5} enters it", col().dim));
+            self.right.set_text(&out);
+            self.right.ix = 0;
+            self.right.full_refresh();
+            return;
+        }
         if let Some(bi) = self.selected_book_idx() {
             let b = &self.cat.books[bi];
             let real = b.kind == BookKind::Real;
@@ -723,7 +853,7 @@ impl App {
 
     fn render_foot(&mut self, msg: &str) {
         let (left, color) = if msg.is_empty() {
-            (" / find \u{00b7} * star \u{00b7} R read \u{00b7} f filter \u{00b7} ^\u{2191}\u{2193} reorder \u{00b7} M move \u{00b7} d mark \u{00b7} < purge \u{00b7} + more \u{00b7} s seed \u{00b7} i edit \u{00b7} w/W width \u{00b7} ^B border \u{00b7} P colours".to_string(), col().dim)
+            (" / find \u{00b7} * star \u{00b7} R read \u{00b7} f filter \u{00b7} ^\u{2191}\u{2193} reorder \u{00b7} M move \u{00b7} d mark \u{00b7} < purge \u{00b7} + more \u{00b7} s seed \u{00b7} i edit \u{00b7} w/W width \u{00b7} ^B border \u{00b7} P colours \u{00b7} ? help".to_string(), col().dim)
         } else {
             (msg.to_string(), col().header)
         };
@@ -869,6 +999,16 @@ impl App {
     /// written → kick off an async write (conjured: Claude writes it) and
     /// keep the UI live; the book opens when you press Enter again once ready.
     fn grab(&mut self) {
+        // Enter on a shelf header descends to the shelf's first book.
+        if self.selected_category().is_some() {
+            if self.sel + 1 < self.entries.len()
+                && matches!(self.entries[self.sel + 1], Entry::Book(_)) {
+                self.sel += 1;
+                self.render_left();
+                self.render_right();
+            }
+            return;
+        }
         let Some(bi) = self.selected_book_idx() else { return; };
         let id = self.cat.books[bi].id.clone();
         if self.cat.books[bi].written && store::book_md(&id).exists() {
@@ -1118,6 +1258,11 @@ impl App {
                     note = Some("colours updated".into());
                 }
                 "+" if !is_deep => { extend = true; break; }
+                "?" => {
+                    for (x, y, w, hh) in shown.drain(..) { display.clear(x, y, w, hh, term_w, term_h); }
+                    self.show_help("Reader \u{2014} keys", READER_HELP);
+                    Crust::clear_screen();
+                }
                 _ => {}
             }
         }
@@ -1247,9 +1392,16 @@ impl App {
                 "*" => self.toggle_star(),
                 "f" => self.cycle_filter(),
                 "R" => self.toggle_read(),
-                "C-UP" => self.move_book(false),
-                "C-DOWN" => self.move_book(true),
+                "C-UP" => if self.selected_category().is_some() { self.move_shelf(false) } else { self.move_book(false) },
+                "C-DOWN" => if self.selected_category().is_some() { self.move_shelf(true) } else { self.move_book(true) },
                 "M" => self.move_to_shelf(),
+                "?" => {
+                    self.show_help("Library \u{2014} keys", SHELF_HELP);
+                    Crust::clear_screen();
+                    self.top.invalidate();
+                    self.foot.invalidate();
+                    self.render_all();
+                }
                 "d" => self.toggle_delete(),
                 "<" => self.purge_marked(),
                 "+" => self.request_more(false),
