@@ -117,7 +117,7 @@ dependencies = [
 
 [[package]]
 name = "fe2o3-crust"
-version = "0.1.27"
+version = "0.1.28"
 dependencies = [
  "crossterm",
  "libc",
@@ -207,7 +207,7 @@ checksum = "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"
 
 [[package]]
 name = "library"
-version = "0.3.4"
+version = "0.3.5"
 dependencies = [
  "fe2o3-crust",
  "fe2o3-glow",

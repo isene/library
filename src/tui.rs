@@ -527,6 +527,75 @@ impl App {
         }
     }
 
+    /// Ctrl+Up / Ctrl+Down — reorder the selected book within its shelf by
+    /// swapping it with the adjacent same-shelf book in the displayed list.
+    /// Bounded to the shelf (won't cross into another category). Persisted.
+    fn move_book(&mut self, down: bool) {
+        let Some(cur) = self.selected_book_idx() else { return; };
+        let cat = self.cat.books[cur].category.clone();
+        // Nearest Book entry in the travel direction (skip headings).
+        let mut i = self.sel;
+        let adj = loop {
+            if down {
+                if i + 1 >= self.entries.len() { break None; }
+                i += 1;
+            } else {
+                if i == 0 { break None; }
+                i -= 1;
+            }
+            if let Entry::Book(bi) = self.entries[i] { break Some(bi); }
+        };
+        match adj {
+            Some(bi) if self.cat.books[bi].category == cat => {
+                let id = self.cat.books[cur].id.clone();
+                self.cat.books.swap(cur, bi);
+                let _ = self.cat.save();
+                self.rebuild(Some(id));
+                self.render_left();
+                self.render_right();
+            }
+            _ => self.render_foot(if down {
+                " Already at the bottom of this shelf."
+            } else {
+                " Already at the top of this shelf."
+            }),
+        }
+    }
+
+    /// `M` — move the selected book to another shelf (category). The existing
+    /// shelves are listed in the right pane while you type the target (a new
+    /// name creates a shelf). Persisted.
+    fn move_to_shelf(&mut self) {
+        let Some(cur) = self.selected_book_idx() else { return; };
+        let cur_cat = self.cat.books[cur].category.clone();
+        // List the shelves in the right pane so the target is easy to pick.
+        let mut panel = style::bold(&style::fg(" Move to which shelf?", col().header));
+        panel.push_str("\n\n");
+        for c in self.cat.categories() {
+            let line = if c == cur_cat { format!(" \u{2192} {}  (current)", c) } else { format!("   {}", c) };
+            panel.push_str(&style::fg(&line, if c == cur_cat { col().sel } else { col().body }));
+            panel.push('\n');
+        }
+        panel.push_str(&style::fg("\n Type a name (a new one creates a shelf), or ESC.", col().dim));
+        self.right.set_text(&panel);
+        self.right.ix = 0;
+        self.right.full_refresh();
+
+        let target = self.foot.ask("Move to shelf: ", "");
+        let target = target.trim().to_string();
+        if self.foot.last_escaped || target.is_empty() || target == cur_cat {
+            self.render_right();
+            self.render_foot(" Shelf unchanged.");
+            return;
+        }
+        let id = self.cat.books[cur].id.clone();
+        self.cat.books[cur].category = target.clone();
+        let _ = self.cat.save();
+        self.rebuild(Some(id));
+        self.render_all();
+        self.render_foot(&format!(" Moved to \u{201c}{}\u{201d}.", target));
+    }
+
     fn render_all(&mut self) {
         self.render_top();
         self.render_left();
@@ -654,7 +723,7 @@ impl App {
 
     fn render_foot(&mut self, msg: &str) {
         let (left, color) = if msg.is_empty() {
-            (" / find \u{00b7} d mark \u{00b7} < purge \u{00b7} * star \u{00b7} + more \u{00b7} s seed \u{00b7} i edit \u{00b7} w/W width \u{00b7} ^B border \u{00b7} P colours".to_string(), col().dim)
+            (" / find \u{00b7} * star \u{00b7} R read \u{00b7} f filter \u{00b7} ^\u{2191}\u{2193} reorder \u{00b7} M move \u{00b7} d mark \u{00b7} < purge \u{00b7} + more \u{00b7} s seed \u{00b7} i edit \u{00b7} w/W width \u{00b7} ^B border \u{00b7} P colours".to_string(), col().dim)
         } else {
             (msg.to_string(), col().header)
         };
@@ -1178,6 +1247,9 @@ impl App {
                 "*" => self.toggle_star(),
                 "f" => self.cycle_filter(),
                 "R" => self.toggle_read(),
+                "C-UP" => self.move_book(false),
+                "C-DOWN" => self.move_book(true),
+                "M" => self.move_to_shelf(),
                 "d" => self.toggle_delete(),
                 "<" => self.purge_marked(),
                 "+" => self.request_more(false),
