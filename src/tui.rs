@@ -45,6 +45,7 @@ const COLOR_SLOTS: &[ColorSlot] = &[
 ];
 
 const LIST_W: u16 = 46;
+const HEADER_BG: u8 = 237; // dark-grey band behind shelf headings in the left pane
 const GEN_N: usize = 10;   // books per `+`/`s` batch
 
 const SPINNER: [&str; 10] = ["⠋","⠙","⠹","⠸","⠼","⠴","⠦","⠧","⠇","⠏"];
@@ -746,11 +747,19 @@ impl App {
             match &self.entries[idx] {
                 Entry::Header(c) => {
                     let selected = idx == self.sel;
-                    let mut name = style::bold(&style::fg(c, col().header));
-                    if selected { name = style::underline(&name); }
-                    // Shared arrow column with the book rows so selection lines up.
-                    let arrow = if selected { style::fg("\u{2192} ", col().sel) } else { "  ".to_string() };
-                    lines.push_str(&format!("{}{}", arrow, name));
+                    // Full-width dark-grey band so shelf headings stand out. The
+                    // arrow keeps the shared selection column with the book rows.
+                    let w = self.left.w as usize;
+                    let label = trunc(&format!("{}{}", if selected { "\u{2192} " } else { "  " }, c), w);
+                    let attrs = if selected { "bu" } else { "b" };
+                    let mut line = style::coded(&label, &format!("{},{},{}", col().header, HEADER_BG, attrs));
+                    // A bg over trailing spaces is dropped, so fill the rest of the
+                    // band with a solid block in the band colour.
+                    let pad = w.saturating_sub(crust::display_width(&label));
+                    if pad > 0 {
+                        line.push_str(&style::coded(&"\u{2588}".repeat(pad), &HEADER_BG.to_string()));
+                    }
+                    lines.push_str(&line);
                 }
                 Entry::Book(bi) => {
                     let b = &self.cat.books[*bi];
