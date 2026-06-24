@@ -676,7 +676,7 @@ impl App {
     fn show_help(&self, title: &str, rows: &[(&str, &str)]) {
         let kw = rows.iter().map(|(k, _)| k.chars().count()).max().unwrap_or(6);
         let cw = rows.iter()
-            .map(|(k, d)| kw + 2 + d.chars().count())
+            .map(|(_k, d)| kw + 2 + d.chars().count())
             .max().unwrap_or(24)
             .max(title.chars().count());
         let pw = ((cw as u16) + 4).min(self.cols.saturating_sub(2)).max(24);
