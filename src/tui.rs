@@ -1486,9 +1486,25 @@ fn render_markdown(md: &str, width: usize, img_dir: &std::path::Path, images_ok:
 {
     let mut out: Vec<String> = Vec::new();
     let mut figs: Vec<FigPos> = Vec::new();
-    for raw in md.lines() {
+    let lines: Vec<&str> = md.lines().collect();
+    let mut i = 0;
+    while i < lines.len() {
+        let raw = lines[i];
         let line = raw.trim_end();
         let trimmed = line.trim();
+        // A markdown table (header row, `|---|` separator, then body rows):
+        // render as aligned, padded columns instead of raw pipes.
+        if trimmed.starts_with('|') && i + 1 < lines.len() && is_table_sep(lines[i + 1]) {
+            let mut rows = vec![split_row(trimmed)];
+            let mut j = i + 2;
+            while j < lines.len() && lines[j].trim_start().starts_with('|') {
+                rows.push(split_row(lines[j].trim()));
+                j += 1;
+            }
+            render_table(&rows, &mut out);
+            i = j;
+            continue;
+        }
         if let Some(inner) = trimmed.strip_prefix("[[EQ").and_then(|r| r.strip_suffix("]]")) {
             if let Ok(n) = inner.trim().parse::<usize>() {
                 let png = img_dir.join(format!("eq{}.png", n));
@@ -1501,7 +1517,7 @@ fn render_markdown(md: &str, width: usize, img_dir: &std::path::Path, images_ok:
                     out.push(style::fg("   (equation unavailable)", col().dim));
                 }
                 out.push(String::new());
-                continue;
+                i += 1; continue;
             }
         }
         if let Some(inner) = trimmed.strip_prefix("[[FIG").and_then(|r| r.strip_suffix("]]")) {
@@ -1524,7 +1540,7 @@ fn render_markdown(md: &str, width: usize, img_dir: &std::path::Path, images_ok:
                     out.push(style::fg("   (figure unavailable)", col().dim));
                 }
                 out.push(String::new());
-                continue;
+                i += 1; continue;
             }
         }
         if let Some(t) = line.strip_prefix("# ") {
@@ -1548,8 +1564,59 @@ fn render_markdown(md: &str, width: usize, img_dir: &std::path::Path, images_ok:
                 out.push(style::fg(&style_inline(wl), col().reader_fg));
             }
         }
+        i += 1;
     }
     (out, figs)
+}
+
+/// True for a markdown table separator row like `|---|:--:|---|`.
+fn is_table_sep(s: &str) -> bool {
+    let t = s.trim();
+    t.starts_with('|') && t.contains('-')
+        && t.chars().all(|c| matches!(c, '|' | '-' | ':' | ' '))
+}
+
+/// Split a `| a | b |` row into trimmed cells (outer pipes dropped).
+fn split_row(s: &str) -> Vec<String> {
+    s.trim().trim_start_matches('|').trim_end_matches('|')
+        .split('|').map(|c| c.trim().to_string()).collect()
+}
+
+/// Visible width of a cell as painted: `**`/`*` markers drop out (they turn
+/// into attributes); backticks stay, since the reader shows them literally.
+fn cell_width(s: &str) -> usize {
+    crust::display_width(&s.replace("**", "").replace('*', ""))
+}
+
+/// Render a parsed table as aligned columns: a bold header in the subhead
+/// colour, a dim rule, then body rows. Pushed straight to `out`, unwrapped.
+fn render_table(rows: &[Vec<String>], out: &mut Vec<String>) {
+    let cols = rows.iter().map(|r| r.len()).max().unwrap_or(0);
+    if cols == 0 { return; }
+    let mut w = vec![0usize; cols];
+    for r in rows {
+        for (c, cell) in r.iter().enumerate() { w[c] = w[c].max(cell_width(cell)); }
+    }
+    out.push(String::new());
+    for (ri, r) in rows.iter().enumerate() {
+        let mut line = String::from(" ");
+        for c in 0..cols {
+            let cell = r.get(c).map(String::as_str).unwrap_or("");
+            line.push_str(&style_inline(cell));
+            line.push_str(&" ".repeat(w[c].saturating_sub(cell_width(cell))));
+            if c + 1 < cols { line.push_str("  "); }
+        }
+        out.push(if ri == 0 {
+            style::bold(&style::fg(&line, col().reader_h3))
+        } else {
+            style::fg(&line, col().reader_fg)
+        });
+        if ri == 0 {
+            let cw = w.iter().sum::<usize>() + 2 * cols.saturating_sub(1);
+            out.push(format!(" {}", style::fg(&"\u{2500}".repeat(cw), col().dim)));
+        }
+    }
+    out.push(String::new());
 }
 
 /// Apply inline **bold** then *italic*. Crust's bold/italic reset only
@@ -1683,4 +1750,28 @@ fn wrap(text: &str, width: usize) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod table_tests {
+    use super::*;
+    fn vis(s: &str) -> String { crust::strip_ansi(s) }
+
+    #[test]
+    fn renders_aligned_columns() {
+        let md = "| Symbol | Means | Example |\n\
+                  |--------|-------|---------|\n\
+                  | `=` | bind a value | `x = 3` |\n\
+                  | `:` | a type | `x : Int` |\n";
+        let (out, _) = render_markdown(md, 80, std::path::Path::new("/tmp"), false);
+        let v: Vec<String> = out.iter().map(|l| vis(l))
+            .filter(|l| !l.trim().is_empty()).collect();
+        // header, dim rule, two body rows — separator markdown is dropped.
+        assert_eq!(v.len(), 4, "{:#?}", v);
+        assert!(!v.iter().any(|l| l.contains("---")), "raw separator leaked");
+        assert!(v[1].contains('\u{2500}'), "no header rule");
+        assert!(v[2].contains("`=`"), "backticks not preserved");
+        // Column 2 starts at the same offset in header and body (alignment).
+        assert_eq!(v[0].find("Means"), v[2].find("bind"), "columns misaligned");
+    }
 }
