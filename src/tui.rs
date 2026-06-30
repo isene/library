@@ -124,7 +124,7 @@ const READER_HELP: &[(&str, &str)] = &[
     ("w / W", "reading width"),
     ("m", "set bookmark"),
     ("e", "export PDF"),
-    ("c", "discuss with Claude"),
+    ("Ctrl+a", "discuss with Claude (full session)"),
     ("d", "define highlighted term"),
     ("+", "deepen (longer rewrite)"),
     ("P", "colours"),
@@ -1204,7 +1204,7 @@ impl App {
             let ext_hint = if is_deep { "" } else { " \u{00b7} + deepen" };
             match &note {
                 Some(m) => self.foot.say(&style::fg(&format!(" {}", m), col().header)),
-                None => self.foot.say(&style::fg(&format!(" j/k \u{00b7} SPACE/b \u{00b7} g/G \u{00b7} w/W width \u{00b7} m mark \u{00b7} e pdf \u{00b7} c discuss \u{00b7} d define{} \u{00b7} q back", ext_hint), col().dim)),
+                None => self.foot.say(&style::fg(&format!(" j/k \u{00b7} SPACE/b \u{00b7} g/G \u{00b7} w/W width \u{00b7} m mark \u{00b7} e pdf \u{00b7} ^A discuss \u{00b7} d define{} \u{00b7} q back", ext_hint), col().dim)),
             }
 
             // Show figures fully inside the current view.
@@ -1282,7 +1282,7 @@ impl App {
                         Err(e) => note = Some(format!("PDF failed: {}", e)),
                     }
                 }
-                "c" => {
+                "C-A" => { // Fe2O3-standard: full CC session
                     let frac = if max_top == 0 { 0.0 } else { top as f32 / max_top as f32 };
                     let context = if is_deep { current_chapter(&md, frac) } else { md.clone() };
                     for (x, y, w, hh) in shown.drain(..) { display.clear(x, y, w, hh, term_w, term_h); }

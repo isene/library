@@ -126,7 +126,7 @@ library --list       # print the catalogue
 | `w` / `W` | narrow / widen the text |
 | `m` | set / move your bookmark here (resumes there next open; syncs to the phone) |
 | `e` | export the book (with figures) to a PDF beside the source |
-| `c` | discuss the text in a Claude session (full book, or current chapter for a deep dive) |
+| `Ctrl+A` | discuss the text in a Claude session (full book, or current chapter for a deep dive) |
 | `d` | define the highlighted word/phrase in context |
 | `+` | extend a quick read into a full book |
 | `P` | colour configuration popup |
