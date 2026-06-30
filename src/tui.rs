@@ -5,7 +5,7 @@
 //! with a spinner so the UI stays live). Grabbing a book to read is the
 //! next build step.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{OnceLock, RwLock};
 
@@ -162,6 +162,11 @@ pub struct App {
     importing: Vec<(String, String, Option<std::path::PathBuf>)>,
     /// Active shelf filter (cycled with `f`).
     filter: Filter,
+    /// Cached reading progress per book id (bookmark fraction 0..1).
+    /// Populated from `bookmark::load` so render_left never touches the
+    /// filesystem in the keystroke hot path. Refreshed on startup, after
+    /// reading a book, and on reload.
+    progress: HashMap<String, f32>,
 }
 
 pub fn run() {
@@ -216,10 +221,24 @@ impl App {
             import_tx, import_rx,
             importing: Vec::new(),
             filter: Filter::All,
+            progress: HashMap::new(),
         };
         app.apply_border_state();
         app.rebuild(None);
+        app.refresh_progress();
         app
+    }
+
+    /// Reload the cached reading-progress map from the synced bookmark
+    /// files (one per book). Cheap and infrequent — NOT called per render
+    /// or per navigation; render_left reads the in-memory map instead.
+    fn refresh_progress(&mut self) {
+        self.progress.clear();
+        for b in &self.cat.books {
+            if let Some(p) = bookmark::load(&b.id) {
+                self.progress.insert(b.id.clone(), p);
+            }
+        }
     }
 
     /// Map the 0-3 border mode onto the two panes (0 none, 1 right, 2 both,
@@ -765,7 +784,16 @@ impl App {
                     let b = &self.cat.books[*bi];
                     let marked = self.delete_marked.contains(&b.id);
                     let selected = idx == self.sel;
-                    let title = trunc(&b.title, (self.list_w as usize).saturating_sub(6));
+                    // Reading-progress suffix for books with a saved bookmark
+                    // (a fraction 0..1). Shown dim at the row's tail; the title
+                    // budget shrinks to make room so it never overflows.
+                    let prog_label = match self.progress.get(&b.id) {
+                        Some(p) => format!(" {}%", (p.clamp(0.0, 1.0) * 100.0).round() as i32),
+                        None => String::new(),
+                    };
+                    let prog_w = crust::display_width(&prog_label);
+                    let title = trunc(&b.title,
+                        (self.list_w as usize).saturating_sub(6 + prog_w));
                     // Markers sit tight against the title — no padding columns to
                     // get swept under the selection underline. ✓ = read, ★ = star.
                     let mut content = String::new();
@@ -784,6 +812,9 @@ impl App {
                     // Pointer-style: a cyan arrow, one plain space, the title.
                     let arrow = if selected { style::fg("\u{2192}", col().sel) } else { " ".to_string() };
                     lines.push_str(&format!("{} {}", arrow, styled));
+                    if !prog_label.is_empty() {
+                        lines.push_str(&style::fg(&prog_label, col().dim));
+                    }
                 }
             }
             lines.push('\n');
@@ -1022,6 +1053,12 @@ impl App {
         let id = self.cat.books[bi].id.clone();
         if self.cat.books[bi].written && store::book_md(&id).exists() {
             self.read_book(&id);
+            // The reader may have moved the bookmark (m); refresh this
+            // book's cached progress so the shelf % reflects it.
+            match bookmark::load(&id) {
+                Some(p) => { self.progress.insert(id.clone(), p); }
+                None => { self.progress.remove(&id); }
+            }
             return;
         }
         if self.writing.contains(&id) {
@@ -1434,6 +1471,7 @@ impl App {
                 "ENTER" | "RIGHT" => self.grab(),
                 "r" => {
                     self.cat = Catalog::load();
+                    self.refresh_progress();
                     self.rebuild(None);
                     self.render_all();
                     self.render_foot(" Reloaded.");
