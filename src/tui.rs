@@ -95,6 +95,22 @@ impl Filter {
     }
 }
 
+/// Shelf sort order, toggled with `o`. `Shelf` keeps the catalog's
+/// category grouping (the default); `Progress` drops the headers and
+/// ranks every book by how far it's read — most-progressed first,
+/// finished (100% / read) books sunk to the very bottom.
+#[derive(Clone, Copy, PartialEq)]
+enum SortMode { Shelf, Progress }
+
+impl SortMode {
+    fn next(self) -> Self {
+        match self { SortMode::Shelf => SortMode::Progress, SortMode::Progress => SortMode::Shelf }
+    }
+    fn label(&self) -> &'static str {
+        match self { SortMode::Shelf => "shelves", SortMode::Progress => "reading progress" }
+    }
+}
+
 /// Key help shown by `?` in the shelf view.
 const SHELF_HELP: &[(&str, &str)] = &[
     ("j / k  \u{2191}\u{2193}", "move (books and shelf headers)"),
@@ -103,6 +119,7 @@ const SHELF_HELP: &[(&str, &str)] = &[
     ("\u{21b5} / \u{2192}", "open book (on a header: enter shelf)"),
     ("/", "search"),
     ("f", "filter: all / rendered / starred / unread"),
+    ("o", "sort: shelves / reading progress"),
     ("* / R", "star / mark read"),
     ("Ctrl+\u{2191}/\u{2193}", "reorder book (on a header: move shelf)"),
     ("M", "move book to a shelf (new name = new shelf)"),
@@ -162,6 +179,8 @@ pub struct App {
     importing: Vec<(String, String, Option<std::path::PathBuf>)>,
     /// Active shelf filter (cycled with `f`).
     filter: Filter,
+    /// Active shelf sort order (toggled with `o`).
+    sort: SortMode,
     /// Cached reading progress per book id (bookmark fraction 0..1).
     /// Populated from `bookmark::load` so render_left never touches the
     /// filesystem in the keystroke hot path. Refreshed on startup, after
@@ -221,6 +240,7 @@ impl App {
             import_tx, import_rx,
             importing: Vec::new(),
             filter: Filter::All,
+            sort: SortMode::Shelf,
             progress: HashMap::new(),
         };
         app.apply_border_state();
@@ -474,15 +494,36 @@ impl App {
         let want = keep.or_else(|| self.selected_book_id());
         let q = self.search.to_lowercase();
         let mut entries = Vec::new();
-        for category in self.cat.categories() {
-            // Books in this category that match the active search (if any).
-            let hits: Vec<usize> = self.cat.books.iter().enumerate()
-                .filter(|(_, b)| b.category == category && book_matches(b, &q) && self.filter.accepts(b))
-                .map(|(i, _)| i)
-                .collect();
-            if hits.is_empty() { continue; } // skip empty categories under a search
-            entries.push(Entry::Header(category.clone()));
-            for i in hits { entries.push(Entry::Book(i)); }
+        match self.sort {
+            SortMode::Shelf => {
+                for category in self.cat.categories() {
+                    // Books in this category that match the active search (if any).
+                    let hits: Vec<usize> = self.cat.books.iter().enumerate()
+                        .filter(|(_, b)| b.category == category && book_matches(b, &q) && self.filter.accepts(b))
+                        .map(|(i, _)| i)
+                        .collect();
+                    if hits.is_empty() { continue; } // skip empty categories under a search
+                    entries.push(Entry::Header(category.clone()));
+                    for i in hits { entries.push(Entry::Book(i)); }
+                }
+            }
+            SortMode::Progress => {
+                // Flat, header-less list ranked by reading progress. Most-read
+                // first (descending %), then finished books (100% or read-marked)
+                // sunk to the very bottom. Ties break on title.
+                let mut hits: Vec<usize> = self.cat.books.iter().enumerate()
+                    .filter(|(_, b)| book_matches(b, &q) && self.filter.accepts(b))
+                    .map(|(i, _)| i)
+                    .collect();
+                let prog = |i: usize| self.progress.get(&self.cat.books[i].id).copied().unwrap_or(0.0);
+                let finished = |i: usize| self.cat.books[i].read || prog(i) >= 0.995;
+                hits.sort_by(|&a, &b| {
+                    finished(a).cmp(&finished(b))                       // unfinished (false) first
+                        .then_with(|| prog(b).partial_cmp(&prog(a)).unwrap_or(std::cmp::Ordering::Equal))
+                        .then_with(|| self.cat.books[a].title.to_lowercase().cmp(&self.cat.books[b].title.to_lowercase()))
+                });
+                for i in hits { entries.push(Entry::Book(i)); }
+            }
         }
         self.entries = entries;
         // Restore selection by id, else land on the first book.
@@ -557,6 +598,14 @@ impl App {
         self.render_all();
         let n = self.entries.iter().filter(|e| matches!(e, Entry::Book(_))).count();
         self.render_foot(&format!(" Filter: {} \u{2014} {} book(s) \u{00b7} f cycles", self.filter.label(), n));
+    }
+
+    /// `o` — toggle the shelf sort: shelves <-> reading progress.
+    fn cycle_sort(&mut self) {
+        self.sort = self.sort.next();
+        self.rebuild(None);
+        self.render_all();
+        self.render_foot(&format!(" Sort: {} \u{00b7} o toggles", self.sort.label()));
     }
 
     /// `R` — toggle the "read" mark on the selected book (persisted).
@@ -735,7 +784,8 @@ impl App {
         let mark_s = if marked > 0 { format!("  \u{00b7}  {} marked", marked) } else { String::new() };
         let search_s = if self.search.is_empty() { String::new() } else { format!("  \u{00b7}  /{}", self.search) };
         let filter_s = if self.filter == Filter::All { String::new() } else { format!("  \u{00b7}  [{}]", self.filter.label()) };
-        let title = format!(" library   {} books \u{00b7} {} written{}{}{}", n, written, mark_s, filter_s, search_s);
+        let sort_s = if self.sort == SortMode::Progress { "  \u{00b7}  [by progress]".to_string() } else { String::new() };
+        let title = format!(" library   {} books \u{00b7} {} written{}{}{}{}", n, written, mark_s, filter_s, sort_s, search_s);
         // Right side: a live "brewing" indicator while batches generate in
         // the background. Keys live in the footer only (no duplicate map).
         let right = if self.gen_in_flight > 0 && !self.writing.is_empty() {
@@ -1398,15 +1448,13 @@ impl App {
              pushback, connections to other things. When I'm done, /exit returns me to \
              the reader.",
             title, scope, tmpfile);
-        print!("\x1b[?2004l");
-        let _ = std::io::stdout().flush();
+        Crust::disable_bracketed_paste();
         Crust::cleanup();
         Crust::clear_screen();
         let _ = std::process::Command::new("claude").arg(&initial).status();
         Crust::init();
         Crust::set_app_identity("Library");
-        print!("\x1b[?2004h");
-        let _ = std::io::stdout().flush();
+        Crust::enable_bracketed_paste();
         let _ = std::fs::remove_file(&tmpfile);
     }
 
@@ -1437,9 +1485,12 @@ impl App {
                 "G" | "END" => self.go_edge(true),
                 "*" => self.toggle_star(),
                 "f" => self.cycle_filter(),
+                "o" => self.cycle_sort(),
                 "R" => self.toggle_read(),
-                "C-UP" => if self.selected_category().is_some() { self.move_shelf(false) } else { self.move_book(false) },
-                "C-DOWN" => if self.selected_category().is_some() { self.move_shelf(true) } else { self.move_book(true) },
+                "C-UP" => if self.sort == SortMode::Progress { self.render_foot(" Reorder only in shelf sort (press o).") }
+                          else if self.selected_category().is_some() { self.move_shelf(false) } else { self.move_book(false) },
+                "C-DOWN" => if self.sort == SortMode::Progress { self.render_foot(" Reorder only in shelf sort (press o).") }
+                          else if self.selected_category().is_some() { self.move_shelf(true) } else { self.move_book(true) },
                 "M" => self.move_to_shelf(),
                 "?" => {
                     self.show_help("Library \u{2014} keys", SHELF_HELP);
