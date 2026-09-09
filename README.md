@@ -87,6 +87,7 @@ cd library && cargo build --release
 - `rsvg-convert` (from librsvg) to rasterise figures.
 - `curl` for fetching real books.
 - `mpv` to listen to a book that has spoken tracks.
+- `ffmpeg` and an OpenAI key (`OPENAI_API_KEY` or `/home/.safe/openai.txt`) for `--speak`.
 - A terminal with kitty graphics for inline figures (e.g.
   [glass](https://github.com/isene/CHasm), kitty, or wezterm); text still reads
   fine without it.
@@ -98,6 +99,7 @@ library              # open the library TUI
 library --seed       # first run: describe your interests, stock the shelves
 library --more       # add more books in the spirit of the current shelves
 library --list       # print the catalogue
+library --speak <id> # read a book aloud into its audio/ folder (OpenAI tts-1, --voice to choose)
 ```
 
 ### Keys
@@ -148,8 +150,9 @@ library --list       # print the catalogue
 
 ### Listening
 
-Drop mp3 files you have made elsewhere into `books/<id>/audio/` and press `p`
-in the reader. The text follows the voice: it jumps to the track's chapter and
+Run `library --speak <id>` to have a book read aloud (OpenAI's tts-1, about
+$0.015 per 1000 characters, `--voice onyx` by default), or drop mp3 files you
+have made elsewhere into `books/<id>/audio/`. Then press `p` in the reader. The text follows the voice: it jumps to the track's chapter and
 scrolls as the track plays. Name a track after its chapter heading
 (`dont-be-afraid.mp3`), number the tracks in chapter order (`01.mp3`,
 `02.mp3`), or use one file for the whole book. Scrolling while listening

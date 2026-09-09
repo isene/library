@@ -27,6 +27,7 @@ fn main() {
     let mut mode: Option<&str> = None;
     let mut text = String::new();
     let mut n: usize = 12;
+    let mut voice = String::from("onyx");
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -37,6 +38,8 @@ fn main() {
             "--import" => { mode = Some("import"); i += 1; }
             "--remath" if i + 1 < args.len() => { mode = Some("remath"); text = args[i + 1].clone(); i += 2; }
             "--n" if i + 1 < args.len() => { n = args[i + 1].parse().unwrap_or(n); i += 2; }
+            "--speak" if i + 1 < args.len() => { mode = Some("speak"); text = args[i + 1].clone(); i += 2; }
+            "--voice" if i + 1 < args.len() => { voice = args[i + 1].clone(); i += 2; }
             "-h" | "--help" => { print_help(); return; }
             _ => { i += 1; }
         }
@@ -49,6 +52,7 @@ fn main() {
         Some("pdf") => cmd_pdf(&text),
         Some("import") => cmd_import(),
         Some("remath") => cmd_remath(&text),
+        Some("speak") => cmd_speak(&text, &voice),
         _ => tui::run(),
     }
 }
@@ -164,6 +168,24 @@ fn cmd_remath(id_or_title: &str) {
     eprintln!("done: {} equation image(s) now in {}", eqs, store::book_img_dir(&book.id).display());
 }
 
+/// `--speak`: one mp3 per section into `audio/`, so the reader can play
+/// the book while the text follows. Kept tracks are not paid for twice.
+fn cmd_speak(id_or_title: &str, voice: &str) {
+    let cat = Catalog::load();
+    let Some(book) = cat.books.iter()
+        .find(|b| b.id == id_or_title || store::slugify(&b.title) == store::slugify(id_or_title))
+    else {
+        eprintln!("no book with id/title '{}'", id_or_title);
+        std::process::exit(1);
+    };
+    eprintln!("reading '{}' aloud in the {} voice…", book.title, voice);
+    match audio::speak_book(&book.id, voice, &mut |line| eprintln!("  {}", line)) {
+        Ok((made, chars)) => eprintln!("done: {} track(s) made, {} characters spoken (about ${:.2}) → {}",
+            made, chars, chars as f64 / 1000.0 * 0.015, audio::dir(&book.id).display()),
+        Err(e) => { eprintln!("{}", e); std::process::exit(1); }
+    }
+}
+
 /// Print the shelf grouped by category — the read-only stand-in until
 /// the TUI exists.
 fn print_shelf(cat: &Catalog) {
@@ -201,6 +223,8 @@ fn print_help() {
          library --more \"<topic>\"     [--n N]   add more books on a topic\n\
          library --list                          print the current shelf\n\
          library --import                        import PDFs/EPUBs queued in ~/.library/inbox/\n\
+         library --speak <id> [--voice V]        read a book aloud into books/<id>/audio/ (OpenAI tts-1,\n\
+                                                 about $0.015 per 1000 characters; voices: alloy echo fable onyx nova shimmer)\n\
          library                                 browse (TUI; press 'a' to add a PDF/EPUB)\n\n\
          Data lives in ~/.library/ (catalog.json + books/<id>/)."
     );

@@ -2,7 +2,8 @@
 //! per chapter named after its heading (`dont-be-afraid.mp3`), numbered
 //! in chapter order (`01.mp3`, `02.mp3`), or one file for the whole book.
 //! mpv plays them over its socket; the reader asks where the voice is
-//! once a second and scrolls the text to match.
+//! once a second and scrolls the text to match. `library --speak <id>`
+//! makes the tracks in the first place, through OpenAI's tts-1.
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
@@ -166,6 +167,196 @@ impl Player {
     }
 }
 
+// ── Making tracks ──────────────────────────────────────────────────
+
+/// Read a book aloud into `audio/`: one mp3 for the title and front
+/// matter, then one per `##` section, named after the heading. Tracks
+/// that exist are kept, so a run that broke off picks up where it was.
+/// Returns (tracks made, characters spoken).
+pub fn speak_book(id: &str, voice: &str, progress: &mut dyn FnMut(&str)) -> Result<(usize, usize), String> {
+    let md = std::fs::read_to_string(store::book_md(id)).map_err(|e| format!("book.md: {}", e))?;
+    let key = std::env::var("OPENAI_API_KEY").ok().filter(|k| !k.trim().is_empty())
+        .or_else(|| std::fs::read_to_string("/home/.safe/openai.txt").ok())
+        .map(|k| k.trim().to_string())
+        .ok_or("no OpenAI key: set OPENAI_API_KEY or put it in /home/.safe/openai.txt")?;
+    let adir = dir(id);
+    std::fs::create_dir_all(&adir).map_err(|e| format!("{}: {}", adir.display(), e))?;
+    let (mut made, mut chars) = (0, 0);
+    for (name, text) in sections(&md) {
+        let out = adir.join(format!("{}.mp3", name));
+        if out.exists() { progress(&format!("{}.mp3 kept", name)); continue; }
+        let pieces = pieces(&text, 4000);
+        let tmp = adir.join(format!(".{}.tmp", name));
+        std::fs::create_dir_all(&tmp).map_err(|e| e.to_string())?;
+        let mut files = Vec::new();
+        for (i, piece) in pieces.iter().enumerate() {
+            let f = tmp.join(format!("{}.mp3", i));
+            speak_piece(&key, voice, piece, &f)?;
+            files.push(f);
+        }
+        if files.len() == 1 {
+            std::fs::rename(&files[0], &out).map_err(|e| e.to_string())?;
+        } else {
+            let list = tmp.join("list.txt");
+            let body: String = files.iter().map(|f| format!("file '{}'\n", f.display())).collect();
+            std::fs::write(&list, body).map_err(|e| e.to_string())?;
+            let st = std::process::Command::new("ffmpeg")
+                .args(["-loglevel", "error", "-y", "-f", "concat", "-safe", "0", "-i"])
+                .arg(&list).args(["-c", "copy"]).arg(&out)
+                .status().map_err(|e| format!("ffmpeg: {}", e))?;
+            if !st.success() { return Err("ffmpeg could not join the pieces".into()); }
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
+        made += 1;
+        chars += text.chars().count();
+        progress(&format!("{}.mp3  {} chars, {} call(s)", name, text.chars().count(), pieces.len()));
+    }
+    Ok((made, chars))
+}
+
+/// One request to OpenAI's speech endpoint, through curl. The key travels
+/// in a config on stdin, never on the command line.
+fn speak_piece(key: &str, voice: &str, text: &str, out: &std::path::Path) -> Result<(), String> {
+    use std::io::Write;
+    let body = out.with_extension("json");
+    let json = serde_json::json!({"model": "tts-1", "voice": voice, "input": text, "response_format": "mp3"});
+    std::fs::write(&body, json.to_string()).map_err(|e| e.to_string())?;
+    let mut child = std::process::Command::new("curl")
+        .args(["-sS", "-f", "-K", "-", "-o"]).arg(out)
+        .stdin(std::process::Stdio::piped()).stderr(std::process::Stdio::piped())
+        .spawn().map_err(|e| format!("curl: {}", e))?;
+    let cfg = format!(
+        "url = \"https://api.openai.com/v1/audio/speech\"\nheader = \"Authorization: Bearer {}\"\n\
+         header = \"Content-Type: application/json\"\ndata = \"@{}\"\n", key, body.display());
+    child.stdin.take().unwrap().write_all(cfg.as_bytes()).map_err(|e| e.to_string())?;
+    let res = child.wait_with_output().map_err(|e| e.to_string())?;
+    let _ = std::fs::remove_file(&body);
+    if !res.status.success() {
+        return Err(format!("speech request failed: {}", String::from_utf8_lossy(&res.stderr).trim()));
+    }
+    Ok(())
+}
+
+/// Lowercase letters and digits joined by dashes, the full length.
+fn slug(s: &str) -> String {
+    let mut out = String::new();
+    for c in s.chars().flat_map(|c| c.to_lowercase()) {
+        if c.is_ascii_alphanumeric() { out.push(c); }
+        else if !out.ends_with('-') && !out.is_empty() { out.push('-'); }
+    }
+    out.trim_end_matches('-').to_string()
+}
+
+/// The book as (track name, spoken text): the front matter first, then
+/// each `##` section with its heading read out.
+fn sections(md: &str) -> Vec<(String, String)> {
+    let title = md.lines().find_map(|l| l.strip_prefix("# ")).unwrap_or("front").trim();
+    let mut out: Vec<(String, String)> = Vec::new();
+    let mut name = format!("00-{}", slug(title));
+    let mut cur = String::new();
+    for line in md.lines() {
+        if let Some(h) = line.strip_prefix("## ") {
+            out.push((name, plain(&cur)));
+            name = format!("{:02}-{}", out.len(), slug(h));
+            cur = String::new();
+        }
+        cur.push_str(line);
+        cur.push('\n');
+    }
+    out.push((name, plain(&cur)));
+    out.into_iter().filter(|(_, t)| !t.trim().is_empty()).collect()
+}
+
+/// Markdown to something a voice can read: headings become sentences,
+/// figures are announced, footnotes, equations, rules and HTML go.
+fn plain(md: &str) -> String {
+    let mut out = String::new();
+    for raw in md.lines() {
+        let line = raw.trim();
+        if line.is_empty() { out.push('\n'); continue; }
+        if line.starts_with("[[EQ") || line.starts_with("[^") || line.starts_with('<')
+            || line.starts_with("---") || line.starts_with("|-") || line.starts_with("|:") { continue; }
+        let text = if let Some(t) = line.strip_prefix("### ") { format!("{}.", t) }
+            else if let Some(t) = line.strip_prefix("## ") { format!("{}.", t) }
+            else if let Some(t) = line.strip_prefix("# ") { format!("{}.", t) }
+            else if let Some(t) = line.strip_prefix("[[FIG ").and_then(|r| r.strip_suffix("]]")) {
+                format!("Figure {}.", t.replacen(':', ":", 1))
+            }
+            else if line.starts_with('|') {
+                line.trim_matches('|').split('|').map(|c| c.trim()).filter(|c| !c.is_empty())
+                    .collect::<Vec<_>>().join(", ") + "."
+            }
+            else if let Some(t) = line.strip_prefix("> ") { t.to_string() }
+            else if let Some(t) = line.strip_prefix("- ").or_else(|| line.strip_prefix("* ")) { t.to_string() }
+            else { line.to_string() };
+        out.push_str(&inline_plain(&text));
+        out.push('\n');
+    }
+    out.split('\n').map(|l| l.trim()).collect::<Vec<_>>().join("\n")
+        .replace("\n\n\n", "\n\n").trim().to_string()
+}
+
+/// Strip inline markup: emphasis, code, links, footnote marks, math.
+fn inline_plain(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let chars: Vec<char> = s.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        match c {
+            '*' | '_' | '`' | '$' => { i += 1; }
+            '\\' => { // a TeX command: drop the backslash and its name
+                i += 1;
+                while i < chars.len() && chars[i].is_ascii_alphabetic() { i += 1; }
+            }
+            '[' => {
+                // [^n] footnote mark → nothing; [text](url) → text; [[...]] → keep inner
+                if chars.get(i + 1) == Some(&'^') {
+                    while i < chars.len() && chars[i] != ']' { i += 1; }
+                    i += 1;
+                } else {
+                    i += 1;
+                }
+            }
+            ']' => {
+                i += 1;
+                if chars.get(i) == Some(&'(') {
+                    while i < chars.len() && chars[i] != ')' { i += 1; }
+                    i += 1;
+                }
+            }
+            _ => { out.push(c); i += 1; }
+        }
+    }
+    out
+}
+
+/// Cut spoken text into pieces of at most `limit` characters at sentence
+/// ends, the size one speech request takes.
+fn pieces(text: &str, limit: usize) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut sent = String::new();
+    let chars: Vec<char> = text.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        sent.push(chars[i]);
+        let end = matches!(chars[i], '.' | '!' | '?') && chars.get(i + 1).map_or(true, |c| c.is_whitespace())
+            || chars[i] == '\n' && chars.get(i + 1) == Some(&'\n');
+        if end || i + 1 == chars.len() {
+            if cur.chars().count() + sent.chars().count() > limit && !cur.trim().is_empty() {
+                out.push(cur.trim().to_string());
+                cur = String::new();
+            }
+            cur.push_str(&sent);
+            sent = String::new();
+        }
+        i += 1;
+    }
+    if !cur.trim().is_empty() { out.push(cur.trim().to_string()); }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -187,6 +378,20 @@ mod tests {
         let hs = h(&[(0, 1, "Title"), (10, 2, "Why the regress does not terminate inside existence")]);
         let cut = vec![PathBuf::from("05-why-the-regress-does-not-terminate-inside-existe.mp3")];
         assert_eq!(spans(&cut, &hs, 120), vec![(10, 120)]);
+    }
+
+    #[test]
+    fn a_book_becomes_named_sections_of_readable_text() {
+        let md = "# The Ground\n\n*Sub*\n\nGeir\n\n## The claim\n\nTake **existence**[^1] as $x$ and [a link](https://x.y).\n\n[[FIG 2: A box]]\n\n[^1]: note\n\n## What survives\n\n| a | b |\n|---|---|\n| 1 | 2 |\n";
+        let secs = sections(md);
+        let names: Vec<&str> = secs.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, vec!["00-the-ground", "01-the-claim", "02-what-survives"]);
+        assert_eq!(secs[0].1, "The Ground.\n\nSub\n\nGeir");
+        assert_eq!(secs[1].1, "The claim.\n\nTake existence as x and a link.\n\nFigure 2: A box.");
+        assert_eq!(secs[2].1, "What survives.\n\na, b.\n1, 2.");
+        let long = "One two. ".repeat(10);
+        let p = pieces(&long, 30);
+        assert!(p.iter().all(|s| s.chars().count() <= 30) && p.concat().len() >= long.trim().len() - p.len());
     }
 
     #[test]
