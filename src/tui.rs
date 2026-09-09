@@ -1398,7 +1398,7 @@ impl App {
                         p.toggle_pause();
                         paused = !paused;
                     } else {
-                        let ti = spans.iter().rposition(|&(s, _)| s <= top + h / 3).unwrap_or(0);
+                        let ti = audio::track_at(&spans, top + h / 3);
                         match audio::Player::start(&tracks, ti) {
                             Ok(p) => { player = Some(p); cur_track = ti; sync_off = 0; paused = false; }
                             Err(e) => note = Some(e),

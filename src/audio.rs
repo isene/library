@@ -49,7 +49,10 @@ pub fn headings(md: &str, lines: &[String]) -> Vec<(usize, u8, String)> {
 /// ends where the nearest later track begins.
 pub fn spans(tracks: &[PathBuf], headings: &[(usize, u8, String)], total: usize) -> Vec<(usize, usize)> {
     // Letters and digits only, so "Don't Be Afraid" meets dont-be-afraid.mp3.
+    // A long name may have been cut short by whatever made the file, so a
+    // heading that begins with a name of 24+ characters counts as well.
     let key = |s: &str| -> String { s.chars().flat_map(|c| c.to_lowercase()).filter(|c| c.is_alphanumeric()).collect() };
+    let fits = |h: &str, s: &str| { let k = key(h); k == s || (s.len() >= 24 && k.starts_with(s)) };
     let stem = |p: &PathBuf| -> String {
         let s = p.file_stem().and_then(|s| s.to_str()).unwrap_or("");
         key(s.trim_start_matches(|c: char| c.is_ascii_digit() || "-_ .".contains(c)))
@@ -57,7 +60,7 @@ pub fn spans(tracks: &[PathBuf], headings: &[(usize, u8, String)], total: usize)
     let mut starts: Vec<Option<usize>> = tracks.iter().map(|t| {
         let s = stem(t);
         if s.is_empty() { return None; }
-        headings.iter().find(|(_, _, h)| key(h) == s).map(|(l, _, _)| *l)
+        headings.iter().find(|(_, _, h)| fits(h, &s)).map(|(l, _, _)| *l)
     }).collect();
     if tracks.len() > 1 && starts.iter().all(|s| s.is_none()) {
         let lvl = if headings.iter().filter(|h| h.1 == 2).count() >= 2 { 2 } else { 1 };
@@ -69,6 +72,16 @@ pub fn spans(tracks: &[PathBuf], headings: &[(usize, u8, String)], total: usize)
         let end = starts.iter().flatten().filter(|&&s| s > start).min().copied().unwrap_or(total);
         (start, end)
     }).collect()
+}
+
+/// The track to play from reading position `pos`: the one whose span
+/// starts nearest above it, the first of them on a tie, else the first.
+pub fn track_at(spans: &[(usize, usize)], pos: usize) -> usize {
+    let mut best: Option<(usize, usize)> = None;
+    for (i, &(s, _)) in spans.iter().enumerate() {
+        if s <= pos && best.map_or(true, |(_, bs)| s > bs) { best = Some((i, s)); }
+    }
+    best.map_or(0, |(i, _)| i)
 }
 
 /// The line to put at the top of the screen so the voice sits a third
@@ -170,6 +183,19 @@ mod tests {
         assert_eq!(spans(&numbered, &hs, 120), vec![(10, 50), (50, 90), (90, 120)]);
         let whole = vec![PathBuf::from("book.mp3")];
         assert_eq!(spans(&whole, &hs, 120), vec![(0, 120)]);
+        // A name cut short by a 48-character slug still finds its heading.
+        let hs = h(&[(0, 1, "Title"), (10, 2, "Why the regress does not terminate inside existence")]);
+        let cut = vec![PathBuf::from("05-why-the-regress-does-not-terminate-inside-existe.mp3")];
+        assert_eq!(spans(&cut, &hs, 120), vec![(10, 120)]);
+    }
+
+    #[test]
+    fn the_track_under_the_cursor_is_the_nearest_start_above_it() {
+        let sp = vec![(1, 40), (40, 90), (0, 1), (90, 120)];
+        assert_eq!(track_at(&sp, 0), 2);
+        assert_eq!(track_at(&sp, 5), 0);
+        assert_eq!(track_at(&sp, 40), 1);
+        assert_eq!(track_at(&sp, 200), 3);
     }
 
     #[test]
