@@ -56,6 +56,8 @@ one-key "make this quick read into a proper book".
 - **Highlight → definition.** Select a word or phrase and get the meaning that
   fits *this* passage.
 - **Quick → deep.** Turn a short read into a full-length book with one key.
+- **Listen.** `library --speak` reads a book aloud, or drop your own mp3 tracks
+  in; the text follows the voice in the reader, on the laptop and the phone.
 - **Syncs to your phone.** Plain JSON + Markdown under `~/.library`, so
   Syncthing mirrors it to the [books](https://github.com/isene/nomad) reader.
 - **Cold when idle.** The event loop blocks on input and only wakes while a
