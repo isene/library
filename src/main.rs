@@ -11,6 +11,7 @@
 //!   library --list                          print the current shelf
 //!   library                                 (TUI — coming next)
 
+mod audio;
 mod bookmark;
 mod claude;
 mod export;

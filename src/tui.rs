@@ -11,6 +11,7 @@ use std::sync::{OnceLock, RwLock};
 
 use crust::{Crust, Input, Pane, style};
 
+use crate::audio;
 use crate::bookmark;
 use crate::claude;
 use crate::import;
@@ -140,6 +141,8 @@ const READER_HELP: &[(&str, &str)] = &[
     ("g / G", "top / bottom"),
     ("w / W", "reading width"),
     ("m", "set bookmark"),
+    ("p", "listen: play / pause the spoken track (j/k nudge the text)"),
+    ("[ / ]", "previous / next track"),
     ("e", "export PDF"),
     ("Ctrl+a", "discuss with Claude (full session)"),
     ("d", "define highlighted term"),
@@ -1226,6 +1229,14 @@ impl App {
         };
         let mut note: Option<String> = None;
         let mut shown: Vec<(u16, u16, u16, u16)> = Vec::new();
+        // Spoken tracks, if the book has any. While one plays the reader
+        // wakes once a second to follow the voice; otherwise it blocks.
+        let tracks = audio::tracks(id);
+        let mut spans = audio::spans(&tracks, &audio::headings(&md, &lines), lines.len());
+        let mut player: Option<audio::Player> = None;
+        let mut sync_off: i64 = 0;
+        let mut cur_track = 0usize;
+        let mut paused = false;
 
         let mut body = Pane::new(2, 2, self.cols.saturating_sub(2), self.rows.saturating_sub(2), col().body as u16, 0);
         body.scroll = false; body.wrap = false;
@@ -1239,7 +1250,11 @@ impl App {
             let pct = if max_top == 0 { 100 } else { top * 100 / max_top };
             let depth_tag = if is_deep { " [deep]" } else { "" };
             let tline = format!(" \u{1f4d6} {}{}", trunc(&title, cols.saturating_sub(24)), depth_tag);
-            let prog = format!("{}% ", pct);
+            let prog = match &player {
+                Some(_) => format!("{} {}/{} \u{00b7} {}% ",
+                    if paused { "\u{23f8}" } else { "\u{25b6}" }, cur_track + 1, tracks.len(), pct),
+                None => format!("{}% ", pct),
+            };
             let pad = cols.saturating_sub(crust::display_width(&tline) + crust::display_width(&prog));
             self.top.say(&format!("{}{}{}",
                 style::bold(&style::fg(&tline, col().sel)), " ".repeat(pad), style::fg(&prog, col().dim)));
@@ -1252,9 +1267,11 @@ impl App {
             body.full_refresh();
 
             let ext_hint = if is_deep { "" } else { " \u{00b7} + deepen" };
+            let listen = if player.is_some() { " \u{00b7} p pause \u{00b7} [ ] track \u{00b7} j/k nudge" }
+                else if !tracks.is_empty() { " \u{00b7} p listen" } else { "" };
             match &note {
                 Some(m) => self.foot.say(&style::fg(&format!(" {}", m), col().header)),
-                None => self.foot.say(&style::fg(&format!(" j/k \u{00b7} SPACE/b \u{00b7} g/G \u{00b7} w/W width \u{00b7} m mark \u{00b7} e pdf \u{00b7} ^A discuss \u{00b7} d define{} \u{00b7} q back", ext_hint), col().dim)),
+                None => self.foot.say(&style::fg(&format!(" j/k \u{00b7} SPACE/b \u{00b7} g/G \u{00b7} w/W width \u{00b7} m mark \u{00b7} e pdf \u{00b7} ^A discuss \u{00b7} d define{}{} \u{00b7} q back", ext_hint, listen), col().dim)),
             }
 
             // Show figures fully inside the current view.
@@ -1272,8 +1289,23 @@ impl App {
                 }
             }
 
-            let Some(key) = Input::getchr(None) else { continue };
+            let key = if player.is_some() { Input::getchr_ms(1000) } else { Input::getchr(None) };
+            let Some(key) = key else {
+                // A second of speech went by: follow the voice.
+                let mut finished = false;
+                if let Some(p) = player.as_mut() {
+                    if let Some((ti, frac)) = p.position() {
+                        cur_track = ti;
+                        top = audio::voice_top(&spans, ti, frac, h, sync_off, max_top);
+                    } else if !p.running() {
+                        finished = true;
+                    }
+                }
+                if finished { player = None; note = Some("\u{25b6} finished".into()); }
+                continue;
+            };
             note = None; // a status note shows until the next key
+            let before = top;
             match key.as_str() {
                 "q" | "ESC" | "h" | "LEFT" => break,
                 "j" | "DOWN" => if top < max_top { top += 1; },
@@ -1288,6 +1320,7 @@ impl App {
                     let _ = self.cat.save();
                     let (l, f) = render_markdown(&md, wrap_w, &img_dir, images_ok);
                     lines = l; figs = f;
+                    spans = audio::spans(&tracks, &audio::headings(&md, &lines), lines.len());
                     for (x, y, w, hh) in shown.drain(..) { display.clear(x, y, w, hh, term_w, term_h); }
                     Crust::clear_screen();
                 }
@@ -1348,6 +1381,7 @@ impl App {
                     self.apply_bar_bg();
                     let (l, f) = render_markdown(&md, wrap_w, &img_dir, images_ok);
                     lines = l; figs = f;
+                    spans = audio::spans(&tracks, &audio::headings(&md, &lines), lines.len());
                     Crust::clear_screen();
                     self.top.invalidate();
                     self.foot.invalidate();
@@ -1359,9 +1393,30 @@ impl App {
                     self.show_help("Reader \u{2014} keys", READER_HELP);
                     Crust::clear_screen();
                 }
+                "p" if !tracks.is_empty() => {
+                    if let Some(p) = player.as_mut() {
+                        p.toggle_pause();
+                        paused = !paused;
+                    } else {
+                        let ti = spans.iter().rposition(|&(s, _)| s <= top + h / 3).unwrap_or(0);
+                        match audio::Player::start(&tracks, ti) {
+                            Ok(p) => { player = Some(p); cur_track = ti; sync_off = 0; paused = false; }
+                            Err(e) => note = Some(e),
+                        }
+                    }
+                }
+                "]" | "[" if player.is_some() => {
+                    let p = player.as_mut().unwrap();
+                    if key == "]" { p.next(); } else { p.prev(); }
+                    sync_off = 0;
+                }
                 _ => {}
             }
+            // Scrolling while listening moves the text against the voice
+            // and stays that way, so a drifted page can be put right.
+            if player.is_some() { sync_off += top as i64 - before as i64; }
         }
+        if let Some(p) = player.take() { p.stop(); }
 
         for (x, y, w, hh) in shown.drain(..) { display.clear(x, y, w, hh, term_w, term_h); }
         Crust::clear_screen();

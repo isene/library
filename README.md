@@ -4,7 +4,7 @@
 
 **A personal library of the books that *should* exist — and a way to read them.**
 
-![Version](https://img.shields.io/badge/version-0.2.0-blue) ![Rust](https://img.shields.io/badge/language-Rust-f74c00) ![License](https://img.shields.io/badge/license-Unlicense-green) ![Platform](https://img.shields.io/badge/platform-Linux-blue) ![Stay Amazing](https://img.shields.io/badge/Stay-Amazing-important)
+![Version](https://img.shields.io/badge/version-0.3.10-blue) ![Rust](https://img.shields.io/badge/language-Rust-f74c00) ![License](https://img.shields.io/badge/license-Unlicense-green) ![Platform](https://img.shields.io/badge/platform-Linux-blue) ![Stay Amazing](https://img.shields.io/badge/Stay-Amazing-important)
 
 Curate a shelf of books that ought to exist but mostly don't. Browse the
 catalogue, star the ones you want, and when you grab a book Claude sits down
@@ -86,6 +86,7 @@ cd library && cargo build --release
   (catalogue, book writing, definitions all run through `claude -p`).
 - `rsvg-convert` (from librsvg) to rasterise figures.
 - `curl` for fetching real books.
+- `mpv` to listen to a book that has spoken tracks.
 - A terminal with kitty graphics for inline figures (e.g.
   [glass](https://github.com/isene/CHasm), kitty, or wezterm); text still reads
   fine without it.
@@ -125,6 +126,8 @@ library --list       # print the catalogue
 | `↑`/`↓` `Space` | scroll |
 | `w` / `W` | narrow / widen the text |
 | `m` | set / move your bookmark here (resumes there next open; syncs to the phone) |
+| `p` | listen: play / pause the book's spoken track; `j`/`k` nudge the text if it drifts from the voice |
+| `[` / `]` | previous / next track |
 | `e` | export the book (with figures) to a PDF beside the source |
 | `Ctrl+A` | discuss the text in a Claude session (full book, or current chapter for a deep dive) |
 | `d` | define the highlighted word/phrase in context |
@@ -139,8 +142,19 @@ library --list       # print the catalogue
 ├── catalog.json                every book idea (metadata only)
 └── books/<id>/
     ├── book.md                 the written text, with [[FIG n: caption]] markers
-    └── img/figN.{svg,png}       the figures
+    ├── img/figN.{svg,png}       the figures
+    └── audio/*.mp3             spoken tracks, if you add any (see below)
 ```
+
+### Listening
+
+Drop mp3 files you have made elsewhere into `books/<id>/audio/` and press `p`
+in the reader. The text follows the voice: it jumps to the track's chapter and
+scrolls as the track plays. Name a track after its chapter heading
+(`dont-be-afraid.mp3`), number the tracks in chapter order (`01.mp3`,
+`02.mp3`), or use one file for the whole book. Scrolling while listening
+moves the text against the voice and stays that way, so a page that has
+drifted can be put right. Tracks sync to the phone with the rest of the book.
 
 Point a Syncthing folder at `~/.library` to read everything on your phone with
 [books](https://github.com/isene/nomad/tree/master/apps/books).
