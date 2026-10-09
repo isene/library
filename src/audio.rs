@@ -176,9 +176,9 @@ impl Player {
 pub fn speak_book(id: &str, voice: &str, progress: &mut dyn FnMut(&str)) -> Result<(usize, usize), String> {
     let md = std::fs::read_to_string(store::book_md(id)).map_err(|e| format!("book.md: {}", e))?;
     let key = std::env::var("OPENAI_API_KEY").ok().filter(|k| !k.trim().is_empty())
-        .or_else(|| std::fs::read_to_string("/home/.safe/openai.txt").ok())
+        .or_else(|| std::fs::read_to_string(store::root().join("openai.txt")).ok())
         .map(|k| k.trim().to_string())
-        .ok_or("no OpenAI key: set OPENAI_API_KEY or put it in /home/.safe/openai.txt")?;
+        .ok_or("no OpenAI key: set OPENAI_API_KEY or put it in ~/.library/openai.txt")?;
     let adir = dir(id);
     std::fs::create_dir_all(&adir).map_err(|e| format!("{}: {}", adir.display(), e))?;
     let (mut made, mut chars) = (0, 0);

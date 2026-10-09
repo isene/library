@@ -89,7 +89,7 @@ cd library && cargo build --release
 - `rsvg-convert` (from librsvg) to rasterise figures.
 - `curl` for fetching real books.
 - `mpv` to listen to a book that has spoken tracks.
-- `ffmpeg` and an OpenAI key (`OPENAI_API_KEY` or `/home/.safe/openai.txt`) for `--speak`.
+- `ffmpeg` and an OpenAI key (`OPENAI_API_KEY` or `~/.library/openai.txt`) for `--speak`.
 - A terminal with kitty graphics for inline figures (e.g.
   [glass](https://github.com/isene/CHasm), kitty, or wezterm); text still reads
   fine without it.
