@@ -950,13 +950,7 @@ impl App {
         } else {
             (msg.to_string(), col().header)
         };
-        let ver = format!("library v{} ", env!("CARGO_PKG_VERSION"));
-        let pad = (self.cols as usize)
-            .saturating_sub(crust::display_width(&left) + crust::display_width(&ver));
-        self.foot.say(&format!("{}{}{}",
-            style::fg(&left, color),
-            " ".repeat(pad),
-            style::fg(&ver, col().dim)));
+        self.foot.say(&crust::with_version(&style::fg(&left, color), self.cols as usize, "library", env!("CARGO_PKG_VERSION")));
     }
 
     fn toggle_star(&mut self) {
